@@ -14,6 +14,20 @@ jobs:
         with:
           submodules: recursive
       - uses: microsoft/setup-msbuild@v2
+      - name: Fetch Omnicept Git LFS files
+        shell: pwsh
+        run: |
+          git lfs install
+          git -C external/Omnicept-SDK lfs install --local
+          git -C external/Omnicept-SDK lfs pull
+
+          $lib = 'external/Omnicept-SDK/lib/Release/msvc2019_64/hp_omnicept.lib'
+
+          Write-Host "=== Omnicept library after LFS pull ==="
+          Get-Item $lib | Select-Object FullName, Length
+
+          $head = Get-Content $lib -AsByteStream -TotalCount 8
+          Write-Host ([System.Text.Encoding]::ASCII.GetString($head))
       - name: Inspect Omnicept library
         shell: pwsh
         run: |
