@@ -14,6 +14,26 @@ jobs:
         with:
           submodules: recursive
       - uses: microsoft/setup-msbuild@v2
+      - name: Inspect Omnicept library
+        shell: pwsh
+        run: |
+          $lib = 'external/Omnicept-SDK/lib/Release/msvc2019_64/hp_omnicept.lib'
+
+          Write-Host "=== Omnicept submodule commit ==="
+          git -C external/Omnicept-SDK rev-parse HEAD
+
+          Write-Host "=== Library info ==="
+          Get-Item $lib | Select-Object FullName, Length
+
+          Write-Host "=== SHA256 ==="
+          Get-FileHash $lib -Algorithm SHA256
+
+          Write-Host "=== First 32 bytes ==="
+          $head = Get-Content $lib -AsByteStream -TotalCount 32
+          Write-Host (($head | ForEach-Object { $_.ToString('X2') }) -join ' ')
+
+          Write-Host "=== First 8 bytes as ASCII ==="
+          Write-Host ([System.Text.Encoding]::ASCII.GetString($head[0..7]))
       - name: Restore NuGet packages
         shell: pwsh
         run: nuget restore OpenXR-Toolkit.sln
