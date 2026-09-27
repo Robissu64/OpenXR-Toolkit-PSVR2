@@ -59,6 +59,21 @@ namespace toolkit::log {
         va_end(va);
     }
 
+    void DiagnosticLog(const char* fmt, ...) {
+        static std::atomic<uint64_t> sequence{0};
+        char message[768];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf_s(message, sizeof(message), _TRUNCATE, fmt, args);
+        va_end(args);
+        Log("[PSVR2-DIAG] seq=%llu tick_ms=%llu pid=%lu tid=%lu %s\n",
+            static_cast<unsigned long long>(++sequence),
+            static_cast<unsigned long long>(GetTickCount64()),
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            message);
+    }
+
     void DebugLog(const char* fmt, ...) {
 #ifdef _DEBUG
         va_list va;

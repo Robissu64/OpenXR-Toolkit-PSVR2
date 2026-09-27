@@ -179,20 +179,29 @@ namespace LAYER_NAMESPACE {
                 std::vector<XrExtensionProperties> extensions(extensionsCount, {XR_TYPE_EXTENSION_PROPERTIES});
                 CHECK_XRCMD(xrEnumerateInstanceExtensionProperties(
                     nullptr, extensionsCount, &extensionsCount, extensions.data()));
+                bool eyeGazeAvailable = false;
                 for (auto extension : extensions) {
                     const std::string extensionName(extension.extensionName);
 
                     TraceLoggingWriteTagged(
                         local, "xrCreateApiLayerInstance_HasExtension", TLArg(extension.extensionName, "Extension"));
                     Log("Runtime supports extension: %s\n", extension.extensionName);
+                    if (extensionName == "XR_EXT_eye_gaze_interaction") {
+                        eyeGazeAvailable = true;
+                        toolkit::log::DiagnosticLog("extension available name=%s version=%u", extension.extensionName,
+                                                    extension.extensionVersion);
+                    }
                     if (extensionName == "XR_EXT_hand_tracking" || extensionName == "XR_EXT_eye_gaze_interaction" ||
                         extensionName == "XR_KHR_win32_convert_performance_counter_time" ||
                         extensionName == "XR_KHR_visibility_mask" || extensionName == "XR_FB_eye_tracking_social") {
                         extensionsToRequest.insert(extensionName);
                     }
                 }
+                DiagnosticLog("extension enumeration count=%u XR_EXT_eye_gaze_interaction_available=%u",
+                              extensionsCount, eyeGazeAvailable);
             } else {
                 Log("Failed to query extensions\n");
+                DiagnosticLog("extension enumeration unavailable");
             }
 
             // Workaround: the Vive runtime does not seem to like our flow of destroying the instance
@@ -240,6 +249,10 @@ namespace LAYER_NAMESPACE {
         }
 
         for (uint32_t i = 0; i < chainInstanceCreateInfo.enabledExtensionCount; i++) {
+            if (std::string_view(chainInstanceCreateInfo.enabledExtensionNames[i]) == "XR_EXT_eye_gaze_interaction") {
+                DiagnosticLog("extension requested name=XR_EXT_eye_gaze_interaction original=%u fast_init=%u",
+                              i < instanceCreateInfo->enabledExtensionCount, fastInitialization);
+            }
             TraceLoggingWriteTagged(local,
                                     "xrCreateApiLayerInstance_UseExtension",
                                     TLArg(chainInstanceCreateInfo.enabledExtensionNames[i], "Extension"));

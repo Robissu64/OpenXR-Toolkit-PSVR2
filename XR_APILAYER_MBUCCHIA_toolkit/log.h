@@ -70,6 +70,9 @@ namespace toolkit::log {
     // General logging function.
     void Log(const char* fmt, ...);
 
+    // Ordered, timestamped text events for comparing native OpenXR and OpenComposite.
+    void DiagnosticLog(const char* fmt, ...);
+
     // Debug logging function. Can make things very slow (only enabled on Debug builds).
     void DebugLog(const char* fmt, ...);
 

@@ -285,6 +285,9 @@ namespace {
                                         XR_VERSION_MINOR(instanceProperties.runtimeVersion),
                                         XR_VERSION_PATCH(instanceProperties.runtimeVersion));
             Log("Using OpenXR runtime %s\n", m_runtimeName.c_str());
+            DiagnosticLog("instance app=%s opencomposite=%u runtime=%s enabled_extensions=%u",
+                          m_applicationName.c_str(), m_isOpenComposite, m_runtimeName.c_str(),
+                          createInfo->enabledExtensionCount);
 
             m_configManager = config::CreateConfigManager(createInfo->applicationInfo.applicationName);
             setOptionsDefaults();
@@ -507,6 +510,9 @@ namespace {
                                        eyeTrackingFBSystemProperties.supportsEyeTracking || m_isOmniceptDetected ||
                                        m_hasPimaxEyeTracker ||
                                        m_configManager->getValue(config::SettingEyeDebugWithController);
+                DiagnosticLog("system=%s eye_gaze_system_support=%u eye_support=%u provider_openxr=%u",
+                              m_systemName.c_str(), eyeTrackingSystemProperties.supportsEyeGazeInteraction,
+                              m_supportEyeTracking, m_eyeTracker && !m_isOmniceptDetected && !m_hasPimaxEyeTracker);
                 const bool isEyeTrackingThruRuntime =
                     m_supportEyeTracking && !(m_isOmniceptDetected || m_hasPimaxEyeTracker);
 
@@ -886,6 +892,8 @@ namespace {
                     if (m_eyeTracker) {
                         m_eyeTracker->beginSession(*session);
                     }
+                    DiagnosticLog("session created session=%p eye_set=%p opencomposite=%u", *session,
+                                  m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE, m_isOpenComposite);
 
                     // Make sure we perform calibration again. We pass these values to the menu and FFR, so in the case
                     // of multi-session applications, we must push those values again.
@@ -893,6 +901,8 @@ namespace {
 
                     // Re-attach action set for the eye tracker if needed.
                     m_isActionSetAttached = false;
+                    m_diagnosticSyncCalls = 0;
+                    m_diagnosticFrames = 0;
 
                     // Remember the XrSession to use.
                     m_vrSession = *session;
@@ -918,6 +928,7 @@ namespace {
                 TLArg(xr::ToCString(beginInfo->primaryViewConfigurationType), "PrimaryViewConfigurationType"));
 
             const XrResult result = OpenXrApi::xrBeginSession(session, beginInfo);
+            DiagnosticLog("xrBeginSession session=%p result=%s", session, xr::ToCString(result));
             if (XR_SUCCEEDED(result) && isVrSession(session)) {
                 m_configManager->setActiveSession(m_applicationName);
 
@@ -936,6 +947,7 @@ namespace {
             TraceLoggingWrite(g_traceProvider, "xrEndSession", TLPArg(session, "Session"));
 
             const XrResult result = OpenXrApi::xrEndSession(session);
+            DiagnosticLog("xrEndSession session=%p result=%s", session, xr::ToCString(result));
             if (XR_SUCCEEDED(result) && isVrSession(session)) {
                 if (m_variableRateShader) {
                     m_variableRateShader->endSession();
@@ -951,6 +963,7 @@ namespace {
 
         XrResult xrDestroySession(XrSession session) override {
             TraceLoggingWrite(g_traceProvider, "xrDestroySession", TLPArg(session, "Session"));
+            DiagnosticLog("xrDestroySession session=%p", session);
 
             // Prepare for shutdown
             if (isVrSession(session)) {
@@ -1290,6 +1303,13 @@ namespace {
 
             XrSessionActionSetsAttachInfo chainAttachInfo = *attachInfo;
             std::vector<XrActionSet> newActionSets;
+            DiagnosticLog("xrAttachSessionActionSets begin session=%p original_count=%u eye_set=%p used=%u artificial_attached=%u",
+                          session, attachInfo->countActionSets,
+                          m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE,
+                          m_isActionSetUsed, m_isActionSetAttached);
+            for (uint32_t i = 0; i < attachInfo->countActionSets; ++i) {
+                DiagnosticLog("xrAttachSessionActionSets original[%u]=%p", i, attachInfo->actionSets[i]);
+            }
             if (m_eyeTracker && isVrSession(session)) {
                 const auto eyeTrackerActionSet = m_eyeTracker->getActionSet();
                 if (eyeTrackerActionSet != XR_NULL_HANDLE) {
@@ -1307,7 +1327,12 @@ namespace {
                 m_isActionSetUsed = attachInfo->countActionSets > 0;
             }
 
-            return OpenXrApi::xrAttachSessionActionSets(session, &chainAttachInfo);
+            const XrResult result = OpenXrApi::xrAttachSessionActionSets(session, &chainAttachInfo);
+            DiagnosticLog("xrAttachSessionActionSets end session=%p result=%s forwarded_count=%u eye_included=%u used=%u artificial_attached=%u",
+                          session, xr::ToCString(result), chainAttachInfo.countActionSets,
+                          chainAttachInfo.countActionSets != attachInfo->countActionSets,
+                          m_isActionSetUsed, m_isActionSetAttached);
+            return result;
         }
 
         XrResult xrCreateAction(XrActionSet actionSet,
@@ -1879,6 +1904,18 @@ namespace {
 
             XrActionsSyncInfo chainSyncInfo = *syncInfo;
             std::vector<XrActiveActionSet> newActiveActionSets;
+            const uint64_t syncNumber = ++m_diagnosticSyncCalls;
+            const bool sampleSync = syncNumber <= 180 || syncNumber % 600 == 0;
+            if (sampleSync) {
+                DiagnosticLog("xrSyncActions begin call=%llu session=%p original_count=%u eye_set=%p used=%u",
+                              static_cast<unsigned long long>(syncNumber), session, syncInfo->countActiveActionSets,
+                              m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE, m_isActionSetUsed);
+                for (uint32_t i = 0; i < syncInfo->countActiveActionSets; ++i) {
+                    DiagnosticLog("xrSyncActions original[%u]=%p path=%s", i,
+                                  syncInfo->activeActionSets[i].actionSet,
+                                  getPath(syncInfo->activeActionSets[i].subactionPath).c_str());
+                }
+            }
             if (m_eyeTracker && isVrSession(session)) {
                 const auto eyeTrackerActionSet = m_eyeTracker->getActionSet();
                 if (eyeTrackerActionSet != XR_NULL_HANDLE) {
@@ -1898,6 +1935,12 @@ namespace {
 
             const XrResult result =
                 chainSyncInfo.countActiveActionSets ? OpenXrApi::xrSyncActions(session, &chainSyncInfo) : XR_SUCCESS;
+            if (sampleSync || XR_FAILED(result)) {
+                DiagnosticLog("xrSyncActions end call=%llu session=%p result=%s forwarded_count=%u eye_included=%u",
+                              static_cast<unsigned long long>(syncNumber), session, xr::ToCString(result),
+                              chainSyncInfo.countActiveActionSets,
+                              chainSyncInfo.countActiveActionSets != syncInfo->countActiveActionSets);
+            }
             if (XR_SUCCEEDED(result) && m_handTracker && isVrSession(session)) {
                 m_performanceCounters.handTrackingTimer->start();
 
@@ -2266,6 +2309,11 @@ namespace {
                 if (m_eyeTracker || m_handTracker) {
                     // Force artifical syncing of actions if the app doesn't seem to use actions.
                     if (!m_isActionSetUsed) {
+                        if (m_diagnosticFrames++ < 12) {
+                            DiagnosticLog("xrBeginFrame artificial_actions session=%p attached=%u eye_set=%p",
+                                          session, m_isActionSetAttached,
+                                          m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE);
+                        }
                         if (m_eyeTracker && m_eyeTracker->getActionSet() != XR_NULL_HANDLE) {
                             if (!m_isActionSetAttached) {
                                 XrSessionActionSetsAttachInfo attachInfo{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
@@ -3443,6 +3491,8 @@ namespace {
         std::shared_ptr<input::IEyeTracker> m_eyeTracker;
         bool m_isActionSetUsed{false};
         bool m_isActionSetAttached{false};
+        uint64_t m_diagnosticSyncCalls{0};
+        uint32_t m_diagnosticFrames{0};
         bool m_needVarjoPollEventWorkaround{false};
         std::shared_ptr<input::IHandTracker> m_handTracker;
 

@@ -1,0 +1,35 @@
+name: PSVR2 eye tracking diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag/psvr2-eye-actions
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: microsoft/setup-msbuild@v2
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: nuget restore OpenXR-Toolkit.sln
+      - name: Build unsigned x64 diagnostic layer
+        shell: pwsh
+        run: msbuild OpenXR-Toolkit.sln /t:XR_APILAYER_MBUCCHIA_toolkit /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $out = 'bin/x64/Release'
+          if (-not (Test-Path "$out/XR_APILAYER_MBUCCHIA_toolkit.dll")) { throw 'Diagnostic DLL missing' }
+          if (-not (Test-Path "$out/XR_APILAYER_MBUCCHIA_toolkit.json")) { throw 'API layer manifest missing' }
+          Copy-Item docs/DIAGNOSTIC_INSTALL.md "$out/DIAGNOSTIC_INSTALL.md"
+          git rev-parse HEAD | Set-Content "$out/BUILD_COMMIT.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PSVR2-Eye-Diagnostic-x64
+          path: bin/x64/Release/
+          if-no-files-found: error
