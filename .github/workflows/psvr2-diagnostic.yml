@@ -19,7 +19,7 @@ jobs:
         run: nuget restore OpenXR-Toolkit.sln
       - name: Build unsigned x64 diagnostic layer
         shell: pwsh
-        run: msbuild OpenXR-Toolkit.sln /t:XR_APILAYER_MBUCCHIA_toolkit /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+        run: msbuild OpenXR-Toolkit.sln /t:XR_APILAYER_MBUCCHIA_toolkit /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v142
       - name: Verify output
         shell: pwsh
         run: |
