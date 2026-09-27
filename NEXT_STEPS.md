@@ -1,6 +1,6 @@
 # Next steps
 
-1. Push branch `diag/psvr2-eye-actions` to the fork and let `.github/workflows/psvr2-diagnostic.yml` run. On CI failure, inspect the first compiler/linker error and patch it. If push is unavailable, apply the delivered git patch to the fork and push from a machine with credentials.
+1. From an authenticated checkout of the fork's `main` at `6b9ecb69a4b2dc714b14a86407868af315d02531`, apply the delivered patch (`git apply PSVR2-Eye-Diagnostic.patch`), commit, and push branch `diag/psvr2-eye-actions`. Alternatively `git fetch PSVR2-Eye-Diagnostic.bundle diag/psvr2-eye-actions:diag/psvr2-eye-actions` and push it. The attempted unauthenticated dry-run push in this workspace failed, so the Windows build workflow has not run. On CI failure inspect the first compiler/linker error and patch it.
 2. Test native Gunman Contracts first and capture Toolkit log.
 3. Test the failing OpenVR game through the same OpenComposite version; capture Toolkit log and OpenComposite log.
 4. Compare event order and the first divergence by session. Confirm whether attach, sync, action state, locate space, or DFR is the failure point.
