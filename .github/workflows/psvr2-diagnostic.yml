@@ -12,6 +12,7 @@ on:
       - release/v1.0
       - fix/native-openxr-app-owned-eye-extension
       - release/v1.1-rc
+      - release/v1.1
 
 jobs:
   build:
@@ -66,7 +67,10 @@ jobs:
         run: |
           $out = 'bin/x64/Release'
           $isV11Rc = $env:GITHUB_REF_NAME -eq 'release/v1.1-rc'
-          $release = if ($isV11Rc) {
+          $isV11Final = $env:GITHUB_REF_NAME -eq 'release/v1.1'
+          $release = if ($isV11Final) {
+            'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64'
+          } elseif ($isV11Rc) {
             'release-output/OpenXR-Toolkit-PSVR2-v1.1-RC-x64'
           } else {
             'release-output/OpenXR-Toolkit-PSVR2-v1.0-x64'
@@ -95,16 +99,23 @@ jobs:
             Copy-Item -LiteralPath $source -Destination "$release/shaders"
           }
 
-          $readme = if ($isV11Rc) { 'docs/PSVR2_V11_RC_README.md' } else { 'docs/PSVR2_V1_README.md' }
-          $notes = if ($isV11Rc) { 'docs/RELEASE_NOTES_v1.1_RC.md' } else { 'docs/RELEASE_NOTES_v1.0.md' }
+          $readme = if ($isV11Final) { 'docs/PSVR2_V11_README.md' } elseif ($isV11Rc) { 'docs/PSVR2_V11_RC_README.md' } else { 'docs/PSVR2_V1_README.md' }
+          $notes = if ($isV11Final) { 'docs/RELEASE_NOTES_v1.1.md' } elseif ($isV11Rc) { 'docs/RELEASE_NOTES_v1.1_RC.md' } else { 'docs/RELEASE_NOTES_v1.0.md' }
           Copy-Item -LiteralPath $readme -Destination "$release/README.md"
           Copy-Item -LiteralPath $notes -Destination "$release/RELEASE_NOTES.md"
           Copy-Item -LiteralPath 'scripts/Install.bat' -Destination $release
           Copy-Item -LiteralPath 'scripts/Uninstall.bat' -Destination $release
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
           git rev-parse HEAD | Set-Content "$release/BUILD_COMMIT.txt"
+      - name: Package v1.1 installation ZIP
+        if: github.ref_name == 'release/v1.1'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64/*' -DestinationPath 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64.zip' -CompressionLevel Optimal
+          Get-Item 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64.zip' | Select-Object Name, Length
+          Get-FileHash 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64/XR_APILAYER_MBUCCHIA_toolkit.dll' -Algorithm SHA256
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_name == 'release/v1.1-rc' && 'OpenXR-Toolkit-PSVR2-v1.1-RC-x64' || github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
-          path: release-output/OpenXR-Toolkit-PSVR2-*/
+          name: ${{ github.ref_name == 'release/v1.1' && 'OpenXR-Toolkit-PSVR2-v1.1-x64' || github.ref_name == 'release/v1.1-rc' && 'OpenXR-Toolkit-PSVR2-v1.1-RC-x64' || github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
+          path: ${{ github.ref_name == 'release/v1.1' && 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64.zip' || 'release-output/OpenXR-Toolkit-PSVR2-*/' }}
           if-no-files-found: error

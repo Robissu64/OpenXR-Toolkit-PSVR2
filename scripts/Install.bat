@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title OpenXR Toolkit PSVR2 v1.0 - Install
-echo OpenXR Toolkit PSVR2 v1.0
+title OpenXR Toolkit PSVR2 v1.1 - Install
+echo OpenXR Toolkit PSVR2 v1.1
 echo Installing OpenXR API layer...
 echo.
 

@@ -4,7 +4,7 @@ An open-source community fork of [OpenXR Toolkit](https://github.com/mbucchia/Op
 
 ## Main features
 
-- PSVR2 eye tracking through OpenXR, including an Eye ActionSet lifecycle fix for OpenVR games using OpenComposite.
+- PSVR2 eye tracking through OpenXR, including an Eye ActionSet lifecycle fix for OpenVR games using OpenComposite and a v1.1 compatibility fix for OpenXR applications that provide their own `XR_EXT_eye_gaze_interaction` bindings.
 - Eye-Tracked Dynamic Foveated Rendering (DFR).
 - Crop Resolution to FOV, with exact tangent-based scaling after automatic, persistent FOV calibration. Games must use the recommended render resolution for the crop to save pixels.
 
@@ -19,7 +19,7 @@ An open-source community fork of [OpenXR Toolkit](https://github.com/mbucchia/Op
 
 If the original OpenXR Toolkit is installed, uninstall it first to avoid registering two layers with the same internal name. Close VR games before installing.
 
-1. Download [`OpenXR-Toolkit-PSVR2-v1.0-x64.zip`](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/download/v1.0/OpenXR-Toolkit-PSVR2-v1.0-x64.zip) from the [v1.0 release](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/tag/v1.0).
+1. Download [`OpenXR-Toolkit-PSVR2-v1.1-x64.zip`](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/download/v1.1/OpenXR-Toolkit-PSVR2-v1.1-x64.zip) from the [v1.1 release](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/tag/v1.1).
 2. Extract the **entire ZIP** to a permanent folder. Do not run the installer from inside the ZIP; keep the extracted DLL, JSON manifest, scripts, and `shaders` folder together.
 3. Double-click `Install.bat` in that folder.
 4. Accept the Windows UAC administrator prompt.
@@ -62,7 +62,7 @@ For native OpenXR games, the installed API layer can load automatically. OpenVR 
 
 ## Tested games
 
-**Only these games have been successfully tested so far:** BONELAB, Gunman Contracts, and COMPOUND Demo. Gunman Contracts was tested through native OpenXR; COMPOUND Demo was tested through OpenComposite. BONELAB was used for the benchmark below.
+**Successfully tested on PSVR2:** BONELAB, Hubris, Gunman Contracts, and COMPOUND Demo. Hubris and Gunman Contracts were validated through native OpenXR with eye tracking, DFR, and Exact Crop. COMPOUND Demo was validated through OpenComposite with eye tracking; Exact Crop was not measured there. BONELAB was used for the benchmark below. These results do not establish compatibility with other games.
 
 Vertigo 2 was also tested, but its OpenComposite path stayed flat even after the Toolkit layer was removed. This is treated as an external OpenComposite/game compatibility issue, not a confirmed Toolkit regression. Other games have not been validated.
 
@@ -80,7 +80,7 @@ The optimized run had **about 55.9% lower average GPU frametime** than baseline;
 
 ## Troubleshooting
 
-If the menu does not appear, check the active OpenXR runtime and that the extracted installation folder has not moved. If DFR is inactive, first confirm eye tracking in PSVR2Toolkit, then check the Toolkit's Eye tracking and Foveated rendering settings. If Crop is `Inactive`, check for incompatible settings such as resolution overrides, FSR/NIS/CAS, Advanced FOV, or FOV 100%. Diagnostic messages are in `%LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log` under `[PSVR2-DIAG]` and `[FOV-CROP]`. See the [installation and troubleshooting guide](docs/PSVR2_V1_README.md).
+If the menu does not appear, check the active OpenXR runtime and that the extracted installation folder has not moved. If DFR is inactive, first confirm eye tracking in PSVR2Toolkit, then check the Toolkit's Eye tracking and Foveated rendering settings. If Crop is `Inactive`, check for incompatible settings such as resolution overrides, FSR/NIS/CAS, Advanced FOV, or FOV 100%. Diagnostic messages are in `%LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log` under `[PSVR2-DIAG]` and `[FOV-CROP]`. See the [v1.1 installation guide](docs/PSVR2_V11_README.md).
 
 ## Credits
 

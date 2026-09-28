@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title OpenXR Toolkit PSVR2 v1.0 - Uninstall
-echo OpenXR Toolkit PSVR2 v1.0
+title OpenXR Toolkit PSVR2 v1.1 - Uninstall
+echo OpenXR Toolkit PSVR2 v1.1
 echo Uninstalling OpenXR API layer...
 echo.
 
