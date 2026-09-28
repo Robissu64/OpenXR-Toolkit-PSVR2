@@ -891,6 +891,7 @@ namespace {
                     }
                     if (m_eyeTracker) {
                         m_eyeTracker->beginSession(*session);
+                        m_eyeTracker->setActionSetReady(!m_isOpenComposite);
                     }
                     DiagnosticLog("session created session=%p eye_set=%p opencomposite=%u", *session,
                                   m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE, m_isOpenComposite);
@@ -899,8 +900,10 @@ namespace {
                     // of multi-session applications, we must push those values again.
                     m_needCalibrateEyeProjections = true;
 
-                    // Re-attach action set for the eye tracker if needed.
+                    // Attachment and sync belong to this session, even when the tracker survives it.
+                    m_isActionSetUsed = false;
                     m_isActionSetAttached = false;
+                    m_isEyeActionSetSynced = false;
                     m_diagnosticSyncCalls = 0;
                     m_diagnosticFrames = 0;
 
@@ -951,6 +954,12 @@ namespace {
             if (XR_SUCCEEDED(result) && isVrSession(session)) {
                 if (m_variableRateShader) {
                     m_variableRateShader->endSession();
+                }
+
+                // Action sets remain attached to the session, but gaze must be synced again after restart.
+                m_isEyeActionSetSynced = false;
+                if (m_eyeTracker && m_isOpenComposite) {
+                    m_eyeTracker->setActionSetReady(false);
                 }
 
                 utilities::RestoreTimerPrecision();
@@ -1027,6 +1036,9 @@ namespace {
                 // We intentionally do not reset hand/eye trackers since they are tied to the instance, not session.
 
                 m_vrSession = XR_NULL_HANDLE;
+                m_isActionSetUsed = false;
+                m_isActionSetAttached = false;
+                m_isEyeActionSetSynced = false;
 
                 // A good check to ensure there are no resources leak is to confirm that the graphics device is
                 // destroyed _before_ we see this message.
@@ -1303,7 +1315,7 @@ namespace {
 
             XrSessionActionSetsAttachInfo chainAttachInfo = *attachInfo;
             std::vector<XrActionSet> newActionSets;
-            DiagnosticLog("xrAttachSessionActionSets begin session=%p original_count=%u eye_set=%p used=%u artificial_attached=%u",
+            DiagnosticLog("xrAttachSessionActionSets begin session=%p original_count=%u eye_set=%p used=%u eye_set_attached=%u",
                           session, attachInfo->countActionSets,
                           m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE,
                           m_isActionSetUsed, m_isActionSetAttached);
@@ -1324,11 +1336,18 @@ namespace {
                     chainAttachInfo.actionSets = newActionSets.data();
                     chainAttachInfo.countActionSets = nextActionSetSlot;
                 }
-                m_isActionSetUsed = attachInfo->countActionSets > 0;
             }
 
             const XrResult result = OpenXrApi::xrAttachSessionActionSets(session, &chainAttachInfo);
-            DiagnosticLog("xrAttachSessionActionSets end session=%p result=%s forwarded_count=%u eye_included=%u used=%u artificial_attached=%u",
+            if (XR_SUCCEEDED(result) && isVrSession(session)) {
+                m_isActionSetUsed = attachInfo->countActionSets > 0;
+                if (chainAttachInfo.countActionSets != attachInfo->countActionSets) {
+                    m_isActionSetAttached = true;
+                    DiagnosticLog("eye_set_attached session=%p set=%p app_attach_seen=%u",
+                                  session, m_eyeTracker->getActionSet(), m_isOpenComposite);
+                }
+            }
+            DiagnosticLog("xrAttachSessionActionSets end session=%p result=%s forwarded_count=%u eye_included=%u used=%u eye_set_attached=%u",
                           session, xr::ToCString(result), chainAttachInfo.countActionSets,
                           chainAttachInfo.countActionSets != attachInfo->countActionSets,
                           m_isActionSetUsed, m_isActionSetAttached);
@@ -1918,7 +1937,7 @@ namespace {
             }
             if (m_eyeTracker && isVrSession(session)) {
                 const auto eyeTrackerActionSet = m_eyeTracker->getActionSet();
-                if (eyeTrackerActionSet != XR_NULL_HANDLE) {
+                if (eyeTrackerActionSet != XR_NULL_HANDLE && (!m_isOpenComposite || m_isActionSetAttached)) {
                     newActiveActionSets.resize(chainSyncInfo.countActiveActionSets + 1);
                     memcpy(newActiveActionSets.data(),
                            chainSyncInfo.activeActionSets,
@@ -1940,6 +1959,14 @@ namespace {
                               static_cast<unsigned long long>(syncNumber), session, xr::ToCString(result),
                               chainSyncInfo.countActiveActionSets,
                               chainSyncInfo.countActiveActionSets != syncInfo->countActiveActionSets);
+            }
+            if (XR_SUCCEEDED(result) && isVrSession(session) &&
+                chainSyncInfo.countActiveActionSets != syncInfo->countActiveActionSets && !m_isEyeActionSetSynced) {
+                m_isEyeActionSetSynced = true;
+                if (m_isOpenComposite) {
+                    m_eyeTracker->setActionSetReady(true);
+                }
+                DiagnosticLog("eye_set_ready session=%p attached=%u sync_seen=1", session, m_isActionSetAttached);
             }
             if (XR_SUCCEEDED(result) && m_handTracker && isVrSession(session)) {
                 m_performanceCounters.handTrackingTimer->start();
@@ -2318,7 +2345,6 @@ namespace {
                             if (!m_isActionSetAttached) {
                                 XrSessionActionSetsAttachInfo attachInfo{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
                                 CHECK_XRCMD(xrAttachSessionActionSets(m_vrSession, &attachInfo));
-                                m_isActionSetAttached = true;
                             }
 
                             // The app does not implement controller support, we must sync actions ourselves.
@@ -3491,6 +3517,7 @@ namespace {
         std::shared_ptr<input::IEyeTracker> m_eyeTracker;
         bool m_isActionSetUsed{false};
         bool m_isActionSetAttached{false};
+        bool m_isEyeActionSetSynced{false};
         uint64_t m_diagnosticSyncCalls{0};
         uint32_t m_diagnosticFrames{0};
         bool m_needVarjoPollEventWorkaround{false};

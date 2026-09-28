@@ -830,6 +830,7 @@ namespace toolkit {
             virtual void update() = 0;
 
             virtual XrActionSet getActionSet() const = 0;
+            virtual void setActionSetReady(bool ready) = 0;
             virtual bool getProjectedGaze(XrVector2f gaze[utilities::ViewCount]) const = 0;
 
             virtual bool isProjectionDistanceSupported() const = 0;

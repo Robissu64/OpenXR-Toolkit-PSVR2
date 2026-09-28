@@ -90,12 +90,30 @@ namespace {
             return m_eyeTrackerActionSet;
         }
 
+        void setActionSetReady(bool ready) override {
+            m_actionSetReady = ready;
+            m_skippedGazeQueries = 0;
+        }
+
         virtual bool getEyeGaze(XrVector3f& projectedPoint) const = 0;
 
         bool getProjectedGaze(XrVector2f gaze[ViewCount]) const {
             assert(m_session != XR_NULL_HANDLE);
 
             if (!m_frameTime) {
+                return false;
+            }
+
+            // OpenComposite can render frames before attaching and syncing the eye action set.
+            if (m_eyeTrackerActionSet != XR_NULL_HANDLE && !m_actionSetReady) {
+                const uint64_t skipped = ++m_skippedGazeQueries;
+                if (skipped <= 12 || skipped % 600 == 0) {
+                    DiagnosticLog("eye gaze_query_skipped_not_ready count=%llu set=%p",
+                                  static_cast<unsigned long long>(skipped), m_eyeTrackerActionSet);
+                }
+                for (uint32_t eye = 0; eye < ViewCount; eye++) {
+                    gaze[eye] = {0.f, 0.f};
+                }
                 return false;
             }
 
@@ -157,6 +175,8 @@ namespace {
         XrTime m_frameTime{0};
 
         XrActionSet m_eyeTrackerActionSet{XR_NULL_HANDLE};
+        bool m_actionSetReady{true};
+        mutable uint64_t m_skippedGazeQueries{0};
 
         mutable XrVector2f m_gaze[ViewCount];
         mutable bool m_valid{false};
