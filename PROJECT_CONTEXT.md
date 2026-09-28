@@ -1,9 +1,22 @@
-# PSVR2 / OpenXR Toolkit 1.3.2 project context
+# PSVR2 / OpenXR Toolkit project context
 
-Goal: independently diagnose and correct eye tracked dynamic foveated rendering (DFR) with OpenComposite. Later, assess resolution cropping tied to FOV. No third party paid code is used.
+## Stable baseline
 
-Hardware: Sony PSVR2, RTX 4070 Super, Ryzen 7 5700X. PSVR2Toolkit is installed and eye tracking confirmed. Gunman Contracts is the positive control: native OpenXR, Toolkit injected, developer gaze/eyeL/eyeR move, visual DFR follows gaze. An OpenVR game through OpenComposite is the negative control; exact game/version and logs await physical testing.
+- Fork: [Robissu64/OpenXR-Toolkit-PSVR2](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2).
+- Branch: `fix/opencomposite-eye-actions`.
+- Functionally validated code commit: `7cde664cf201f586ecac1349d69faed9f9000933`.
+- Hardware: Sony PSVR2, RTX 4070 Super, Ryzen 7 5700X. PSVR2Toolkit supplies eye tracking through SteamVR/OpenXR.
 
-Repositories: [fork](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2), [Toolkit upstream](https://github.com/mbucchia/OpenXR-Toolkit), [OpenComposite openxr](https://gitlab.com/znixian/OpenOVR/-/tree/openxr), [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit). Public conceptual reference: https://patreon.fastfox.racing/posts/3x-fps-in-vr-eye-166260249 .
+Related code: [Toolkit upstream](https://github.com/mbucchia/OpenXR-Toolkit), [OpenComposite OpenXR](https://gitlab.com/znixian/OpenOVR/-/tree/openxr), and [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit). No paid third-party code is used.
 
-Scope of this iteration: instrument action lifecycle and gaze, perform A/B comparison. Crop Resolution to FOV is research only.
+## Phase 1 — Eye Action lifecycle (complete)
+
+Eye-Tracked Foveated Rendering (ETFR) works in both tested paths: COMPOUND Demo through OpenVR → OpenComposite → SteamVR OpenXR → PSVR2, and Gunman Contracts through native OpenXR → SteamVR OpenXR → PSVR2. The COMPOUND session stays stable. Both tests show active gaze actions, successful pose location, changing projected gaze, and working ETFR. No `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED` or `XR_ERROR_ACTIONSET_NOT_ATTACHED` remains in COMPOUND; no `XR_ERROR` was observed in the native Gunman Contracts log.
+
+The original Toolkit attached its eye ActionSet artificially in `xrBeginFrame` before OpenComposite attached its own sets. V2 deferred that artificial attach for OpenComposite but still queried gaze before attachment. V3 waits for the real application's successful attach and a successful sync before querying the eye pose. Native OpenXR retains its existing artificial attach/sync fallback for applications without controller ActionSets.
+
+The diagnostic workflow `PSVR2 eye tracking diagnostic` passed for the validated commit and published `PSVR2-Eye-Diagnostic-x64`. Its MSVC v142, recursive submodule, Git LFS, and Omnicept LFS steps are required build setup.
+
+## Next objective
+
+**PHASE 2 — CROP RESOLUTION TO FOV.** This feature has not been implemented. See `NEXT_STEPS.md` and the preliminary research in `RESEARCH_NOTES.md` before changing rendering behavior.

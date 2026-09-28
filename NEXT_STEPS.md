@@ -1,10 +1,9 @@
 # Next steps
 
-1. From an authenticated checkout of the fork's `main` at `6b9ecb69a4b2dc714b14a86407868af315d02531`, apply the delivered patch (`git apply PSVR2-Eye-Diagnostic.patch`), commit, and push branch `diag/psvr2-eye-actions`. Alternatively `git fetch PSVR2-Eye-Diagnostic.bundle diag/psvr2-eye-actions:diag/psvr2-eye-actions` and push it. The attempted unauthenticated dry-run push in this workspace failed, so the Windows build workflow has not run. On CI failure inspect the first compiler/linker error and patch it.
-2. Test native Gunman Contracts first and capture Toolkit log.
-3. Test the failing OpenVR game through the same OpenComposite version; capture Toolkit log and OpenComposite log.
-4. Compare event order and the first divergence by session. Confirm whether attach, sync, action state, locate space, or DFR is the failure point.
-5. Implement the smallest correction consistent with OpenXR action/session rules, then repeat A/B.
-6. Only after eye tracking diagnosis, design and test optional Crop Resolution to FOV.
+## PHASE 2 — CROP RESOLUTION TO FOV
 
-Blocker for an installable build in this environment: Windows MSVC/MSBuild are not installed and Windows GitHub Actions cannot start until changes reach a remote repository with Actions enabled. The configured workflow builds the layer DLL and all dependencies as `PSVR2-Eye-Diagnostic-x64`; it intentionally does not build the signed MSI installer. Physical PSVR2 testing also requires the user's Windows machine and the exact failing OpenVR game. See `docs/DIAGNOSTIC_INSTALL.md`.
+Phase 1 Eye Action lifecycle is complete and validated on COMPOUND Demo / OpenComposite and Gunman Contracts / native OpenXR. The stable code baseline is commit `7cde664cf201f586ecac1349d69faed9f9000933` on `fix/opencomposite-eye-actions`. Preserve the validated eye action attach/sync behavior.
+
+The next objective is to design and implement an optional Crop Resolution to FOV feature. It has **not** been implemented yet. Begin by tracing how the Toolkit modifies FOV in `xrLocateViews`, how it reports recommended view sizes, and how application swapchain dimensions and submitted projection views relate to those values. Establish a consistent per-eye resolution calculation for asymmetric FOVs and check texture alignment, swapchain limits, and applications that ignore recommended sizes. Use the preliminary geometry notes in `RESEARCH_NOTES.md` as hypotheses to verify, then test performance and visual correctness on both native OpenXR and OpenComposite.
+
+Preserve the passing diagnostic build workflow, including MSVC v142, recursive submodules, Git LFS, and `git -C external/Omnicept-SDK lfs pull`. Its artifact is `PSVR2-Eye-Diagnostic-x64`, with `BUILD_COMMIT.txt` identifying the source commit.
