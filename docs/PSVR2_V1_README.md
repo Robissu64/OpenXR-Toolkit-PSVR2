@@ -1,31 +1,37 @@
-# OpenXR Toolkit PSVR2 v1.0
+# OpenXR Toolkit PSVR2 v1.0: installation and use
 
-Fork comunitário do OpenXR Toolkit para PSVR2, distinto da versão oficial. Inclui Eye Tracking via OpenXR e OpenComposite, Eye-Tracked Foveated Rendering (ETFR) e **Crop Resolution to FOV** com calibração persistente.
+This is an independent community fork of OpenXR Toolkit for PSVR2 on PC. Read the [project README](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/blob/release/v1.0/README.md) for features, tested games, benchmark results, credits, and contribution details.
 
-**Requisitos:** Windows x64, PSVR2 com eye tracking funcional no PSVR2Toolkit, SteamVR configurado como runtime OpenXR e um jogo compatível com OpenXR nativo ou OpenComposite. O resultado de crop depende de o jogo aceitar a resolução recomendada.
+## Before installing
 
-## Instalação
+You need Windows x64, a PSVR2 headset with the Sony PSVR2 PC Adapter, SteamVR set as the active OpenXR runtime, and [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit). Calibrate eye tracking and confirm that it works through PSVR2Toolkit before using Eye-Tracked Foveated Rendering. Close VR games and SteamVR during installation. If the original OpenXR Toolkit is installed, uninstall it first so two layers with the same internal name are not registered.
 
-1. Feche jogos VR e SteamVR. Remova a instalação oficial do OpenXR Toolkit, se presente, para não registrar duas camadas com o mesmo nome interno. Guarde o instalador oficial para uma eventual restauração.
-2. Configure **SteamVR como runtime OpenXR** do PSVR2 e confirme que o eye tracking funciona no PSVR2Toolkit/SteamVR.
-3. Extraia **todos** os arquivos do artifact para uma pasta permanente. Mantenha DLLs, JSON e a pasta `shaders` juntos.
-4. Execute `Install-Layer.ps1` em PowerShell com privilégios de administrador. Mantenha a pasta no lugar após instalar; o manifesto aponta para a DLL nela.
-5. Reinicie SteamVR e o jogo. No menu do Toolkit, ative **Eye tracking** e **Foveated rendering** na aba Performance. Para o crop, na aba Appearance, escolha **Field of view: Simple**, reduza **Adjustment** e ative **Crop Resolution to FOV: On**.
+## Install once
 
-Na primeira execução com Crop On, a resolução usa um fallback linear e o Toolkit salva a calibração do FOV. **Feche e reinicie o jogo** para ativar o modo Exact. Alterações posteriores de Adjustment ou Crop também exigem reinício para mudar a resolução. Reduzir o FOV cria naturalmente bordas ou corte visível na imagem.
+1. Download [`OpenXR-Toolkit-PSVR2-v1.0-x64.zip`](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/download/v1.0/OpenXR-Toolkit-PSVR2-v1.0-x64.zip) from [Releases](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/tag/v1.0).
+2. Extract **all** files to a permanent folder. Do not run the installer from inside the ZIP. Keep the DLLs, JSON manifest, scripts, and `shaders` folder together.
+3. Run `Install-Layer.ps1` as Administrator from that folder. Restart SteamVR and launch a compatible game.
 
-**Estados no menu:** **Inactive** significa Crop On, mas desativado por conflito ou condição não suportada; consulte `[FOV-CROP]`. **Calibration pending** significa fallback linear nesta execução; reinicie após a calibração ser salva. **Exact** significa que o cache válido foi carregado e as razões exatas por tangentes estão em uso.
+The installation is system-wide. You do **not** reinstall for each game or reboot. Do **not** move or delete the extracted folder after installation, because the layer registration points to files there.
 
-## Desinstalação
+To uninstall, close VR games and SteamVR, run `Uninstall-Layer.ps1` as Administrator from that same folder, then remove the folder if desired.
 
-Feche jogos e SteamVR. Execute `Uninstall-Layer.ps1` como administrador na mesma pasta. Para restaurar a instalação anterior, reinstale a versão oficial com o instalador que guardou. O script remove o registro da camada; a pasta pode ser removida após a desinstalação.
+## Configure the Toolkit
 
-## Diagnóstico rápido
+In a compatible OpenXR game, press **Ctrl+F2** to open the menu. Enable **Eye tracking** and **Foveated rendering** in Performance. For the tested BONELAB benchmark example, select **Performance** and **Narrow** for foveated rendering, then in Appearance select **Field of view: Simple**, **Adjustment: 85%**, and **Crop Resolution to FOV: On**. This is the benchmark configuration, not a recommendation for every game. Reducing FOV reduces the visible field of view.
 
-- Menu não aparece: confira a instalação, o runtime OpenXR ativo e o arquivo `BUILD_COMMIT.txt`; mantenha a pasta extraída no lugar.
-- Eye tracking/ETFR inativo: confira eye tracking no PSVR2Toolkit, **Eye tracking** e **Foveated rendering** no menu. Procure `[PSVR2-DIAG]` no log.
-- Crop mostra **Calibration pending**: execute o jogo até que `calibration stored - restart for exact crop` apareça no log; feche e reinicie. O cache fica em `%LOCALAPPDATA%\OpenXR-Toolkit\configs\fov_crop_calibration_*.txt`.
-- Crop mostra **Inactive**: confira conflitos com FSR/NIS/CAS, override manual de resolução, FOV Advanced ou FOV a 100%. O motivo aparece em `[FOV-CROP]`.
-- Sem redução de pixels: alguns jogos ignoram a resolução recomendada. Confira `crop recommendation accepted/ignored` e o tamanho pedido em `xrCreateSwapchain` no log.
+When Crop is first enabled, `Calibration pending` means the Toolkit is observing the original FOV and using a linear estimate. Close the game normally, then start it again; `Exact` means the saved calibration is being used for tangent-based scaling. `Inactive` means Crop cannot apply under current conditions; inspect `[FOV-CROP]` in the log. A changed FOV or Crop setting requires a **game restart** to affect resolution. Swapchains already created by the game are not resized during the session.
 
-Log: `%LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log`. Validado em Gunman Contracts (OpenXR nativo) e COMPOUND Demo (OpenComposite). Outros jogos, runtimes e layouts de swapchain não foram validados nesta versão.
+Native OpenXR games can load the installed layer automatically. OpenVR games require [OpenComposite](https://gitlab.com/znixian/OpenOVR); its compatibility varies by game. Avoid replacing game DLLs without checking that project's game-specific instructions.
+
+## Troubleshooting
+
+- **Menu missing:** confirm SteamVR is the active OpenXR runtime, the installation completed, and the extracted folder has not moved.
+- **Eye tracking or DFR inactive:** confirm eye tracking works in PSVR2Toolkit; then check the Toolkit's Eye tracking and Foveated rendering settings. Look for `[PSVR2-DIAG]` messages.
+- **`Calibration pending` persists:** look for `calibration stored - restart for exact crop`, close the game normally, then relaunch. Calibration files are under `%LOCALAPPDATA%\OpenXR-Toolkit\configs\fov_crop_calibration_*.txt`.
+- **`Inactive`:** check for FSR/NIS/CAS, a manual resolution override, Advanced FOV, or FOV 100%; the reason appears in `[FOV-CROP]`.
+- **No pixel reduction:** some games ignore the recommended resolution. Compare `crop recommendation accepted/ignored` with the requested dimensions logged for `xrCreateSwapchain`.
+
+Log file: `%LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log`.
+
+The only successfully tested games so far are **BONELAB, Gunman Contracts, and COMPOUND Demo**. Vertigo 2 stayed flat through OpenComposite even without this Toolkit layer; other games have not been validated. See the [v1.0 release notes](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/blob/release/v1.0/docs/RELEASE_NOTES_v1.0.md) for scope and limitations.

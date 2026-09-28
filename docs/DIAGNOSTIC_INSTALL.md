@@ -1,5 +1,5 @@
-# Arquivo histórico: instalação da build de diagnóstico
+# Historical diagnostic build installation
 
-As instruções desta fase foram substituídas pelo [guia de instalação da v1.0](PSVR2_V1_README.md). Para uma instalação atual, use o artifact `OpenXR-Toolkit-PSVR2-v1.0-x64` e confira `BUILD_COMMIT.txt`.
+The diagnostic phase instructions have been superseded by the [v1.0 installation guide](PSVR2_V1_README.md). For a current installation, download `OpenXR-Toolkit-PSVR2-v1.0-x64.zip` from the [v1.0 release](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/tag/v1.0) and follow the included `README.md`.
 
-Os logs da v1.0 mantêm `[PSVR2-DIAG]` para lifecycle e falhas de Eye Tracking e `[FOV-CROP]` para calibração, resolução e aceitação da recomendação. As amostras periódicas de frame, sync, pose e projected gaze da fase de diagnóstico foram removidas.
+The v1.0 log retains `[PSVR2-DIAG]` messages for eye tracking lifecycle and failures, and `[FOV-CROP]` messages for calibration, resolution, and acceptance of the recommendation. Periodic frame, sync, pose, and projected gaze samples from diagnostic builds were removed.
