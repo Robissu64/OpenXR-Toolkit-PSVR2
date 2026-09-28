@@ -176,6 +176,8 @@ namespace toolkit {
             bool isVisibilityMaskSupported;
             bool isVisibilityMaskOverrideSupported;
             bool isCACorrectionNeed;
+            bool cropActive;
+            bool cropExact;
             std::string runtimeName;
         };
 

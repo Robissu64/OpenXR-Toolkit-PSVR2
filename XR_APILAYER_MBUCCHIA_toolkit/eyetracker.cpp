@@ -107,7 +107,7 @@ namespace {
             // OpenComposite can render frames before attaching and syncing the eye action set.
             if (m_eyeTrackerActionSet != XR_NULL_HANDLE && !m_actionSetReady) {
                 const uint64_t skipped = ++m_skippedGazeQueries;
-                if (skipped <= 12 || skipped % 600 == 0) {
+                if (skipped == 1) {
                     DiagnosticLog("eye gaze_query_skipped_not_ready count=%llu set=%p",
                                   static_cast<unsigned long long>(skipped), m_eyeTrackerActionSet);
                 }
@@ -195,8 +195,10 @@ namespace {
         void beginSession(XrSession session) override {
             EyeTrackerBase::beginSession(session);
             m_gazeQueries = 0;
-            m_frameCount = 0;
             m_lastGazeActive = false;
+            m_lastPoseError = XR_SUCCESS;
+            m_lastLocateError = XR_SUCCESS;
+            m_locateValidLogged = false;
             DiagnosticLog("eye beginSession session=%p viewSpace=%p", session, m_viewSpace);
 
             m_debugWithController = m_configManager->getValue(SettingEyeDebugWithController);
@@ -283,17 +285,11 @@ namespace {
 
         void beginFrame(XrTime frameTime) override {
             EyeTrackerBase::beginFrame(frameTime);
-            if (++m_frameCount <= 12 || m_frameCount % 600 == 0) {
-                DiagnosticLog("eye beginFrame frame=%llu time=%lld gaze_queries=%llu",
-                              static_cast<unsigned long long>(m_frameCount), static_cast<long long>(frameTime),
-                              static_cast<unsigned long long>(m_gazeQueries));
-            }
         }
 
         bool getEyeGaze(XrVector3f& projectedPoint) const override {
             XrSpaceLocation location{XR_TYPE_SPACE_LOCATION, nullptr};
             const uint64_t query = ++m_gazeQueries;
-            const bool sample = query <= 180 || query % 600 == 0;
 
             // Query the latest eye gaze pose.
             {
@@ -301,11 +297,13 @@ namespace {
                 XrActionStateGetInfo getActionStateInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr};
                 getActionStateInfo.action = m_eyeGazeAction;
                 const XrResult result = m_openXR.xrGetActionStatePose(m_session, &getActionStateInfo, &actionStatePose);
-                if (sample || XR_FAILED(result) || m_lastGazeActive != !!actionStatePose.isActive) {
+                if ((XR_FAILED(result) && result != m_lastPoseError) ||
+                    (XR_SUCCEEDED(result) && m_lastGazeActive != !!actionStatePose.isActive)) {
                     DiagnosticLog("eye xrGetActionStatePose query=%llu session=%p action=%p result=%s isActive=%u",
                                   static_cast<unsigned long long>(query), m_session, m_eyeGazeAction,
                                   xr::ToCString(result), actionStatePose.isActive);
                 }
+                m_lastPoseError = result;
                 CHECK_XRCMD(result);
                 m_lastGazeActive = !!actionStatePose.isActive;
 
@@ -315,7 +313,9 @@ namespace {
             }
 
             const XrResult locateResult = m_openXR.xrLocateSpace(m_eyeSpace, m_viewSpace, m_frameTime, &location);
-            if (sample || XR_FAILED(locateResult) || !Pose::IsPoseValid(location.locationFlags)) {
+            if ((XR_FAILED(locateResult) && locateResult != m_lastLocateError) ||
+                (XR_SUCCEEDED(locateResult) && Pose::IsPoseValid(location.locationFlags) &&
+                 !m_locateValidLogged)) {
                 DiagnosticLog("eye xrLocateSpace query=%llu result=%s flags=0x%x time=%lld pos=(%.4f,%.4f,%.4f) rot=(%.4f,%.4f,%.4f,%.4f)",
                               static_cast<unsigned long long>(query), xr::ToCString(locateResult),
                               static_cast<unsigned int>(location.locationFlags), static_cast<long long>(m_frameTime),
@@ -323,11 +323,13 @@ namespace {
                               location.pose.orientation.x, location.pose.orientation.y, location.pose.orientation.z,
                               location.pose.orientation.w);
             }
+            m_lastLocateError = locateResult;
             CHECK_XRCMD(locateResult);
 
             if (!Pose::IsPoseValid(location.locationFlags)) {
                 return false;
             }
+            m_locateValidLogged = true;
 
             if (m_debugWithController) {
                 location.pose.position.x = location.pose.position.y = location.pose.position.z = 0.f;
@@ -342,12 +344,6 @@ namespace {
             projectedPoint.x = gazeProjectedPoint.m128_f32[0];
             projectedPoint.y = gazeProjectedPoint.m128_f32[1];
             projectedPoint.z = gazeProjectedPoint.m128_f32[2];
-            if (sample) {
-                DiagnosticLog("eye projectedGaze query=%llu point=(%.4f,%.4f,%.4f)",
-                              static_cast<unsigned long long>(query), projectedPoint.x, projectedPoint.y,
-                              projectedPoint.z);
-            }
-
             return true;
         }
 
@@ -361,7 +357,9 @@ namespace {
         XrSpace m_eyeSpace{XR_NULL_HANDLE};
         mutable uint64_t m_gazeQueries{0};
         mutable bool m_lastGazeActive{false};
-        uint64_t m_frameCount{0};
+        mutable XrResult m_lastPoseError{XR_SUCCESS};
+        mutable XrResult m_lastLocateError{XR_SUCCESS};
+        mutable bool m_locateValidLogged{false};
     };
 
     class OpenXrFBEyeTracker : public EyeTrackerBase {

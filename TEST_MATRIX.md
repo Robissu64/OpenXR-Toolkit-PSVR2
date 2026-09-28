@@ -1,10 +1,10 @@
-# Phase 1 A/B test matrix
+# Matriz de validação — PSVR2 RC1
 
-Validated on PSVR2 using code commit `7cde664cf201f586ecac1349d69faed9f9000933` from `fix/opencomposite-eye-actions`.
+| Aplicação | Caminho | Eye Tracking / ETFR | Crop V2 | Estabilidade |
+| --- | --- | --- | --- | --- |
+| Gunman Contracts | OpenXR nativo → SteamVR OpenXR → PSVR2 | Funciona; gaze ativo e ETFR acompanha os olhos | FOV 90%, cache hit, Exact, recomendação aceita: 3400×3468 → 2756×2872; 67,1% dos pixels originais | Sem `XR_ERROR` observado |
+| COMPOUND Demo | OpenVR → OpenComposite → SteamVR OpenXR → PSVR2 | Funciona desde a correção de Eye Actions; attach e sync ordenados | V2 instalada; sanity check de abertura, sem medição de resolução nesta etapa | Abre sem popup/crash |
 
-| Case | OpenXR path | Eye ActionSet lifecycle | Gaze and ETFR | Errors / stability | Result |
-| --- | --- | --- | --- | --- | --- |
-| COMPOUND Demo | OpenVR → OpenComposite (`OpenComposite_compound`) → SteamVR OpenXR → PSVR2 | Attached with OpenComposite's real ActionSets; included in `xrSyncActions`; `eye_set_ready` after successful attach and sync | `xrGetActionStatePose`: `XR_SUCCESS`, `isActive=1`; `xrLocateSpace`: `XR_SUCCESS`; projected gaze varies with eye movement; ETFR works | Opens normally; session stable; no `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED` or `XR_ERROR_ACTIONSET_NOT_ATTACHED` | Pass |
-| Gunman Contracts | Native OpenXR (`opencomposite=0`) → SteamVR OpenXR → PSVR2 | Eye ActionSet attached and synced; first successful sync precedes active pose | `xrGetActionStatePose`: `XR_SUCCESS`, `isActive=1`; `xrLocateSpace`: `XR_SUCCESS`; projected gaze varies; ETFR works | Opens normally; no regression observed; no `XR_ERROR` in log | Pass |
+O valor 67,1% é `2756×2872 / (3400×3468)`; a redução de 32,9% refere-se à quantidade de pixels recomendada, não a FPS medido. A validação acima é do código V2 `9d132cd63425831266b589b5cda7e7f4149822a5`. A RC1 adiciona hardening e empacotamento; aguarda verificação final em hardware.
 
-The diagnostic logs establish attach, sync, readiness, action-state, space-location, and projected-gaze order per `XrSession`. OpenComposite may create more than one session during startup; compare events by session handle. Crop Resolution to FOV was outside Phase 1 and remains untested.
+Para analisar outro jogo, compare `[FOV-CROP]` (cache, modo, dimensões entregues, `xrCreateSwapchain`, aceitação) e `[PSVR2-DIAG]` (criação/attach/sync/readiness, falhas). Apps que ignoram a recomendação podem não economizar pixels.

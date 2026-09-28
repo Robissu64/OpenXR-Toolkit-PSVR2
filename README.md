@@ -1,3 +1,7 @@
+# OpenXR Toolkit PSVR2 - RC1
+
+Para instalar esta build comunitária de teste, consulte [o guia da RC1](docs/PSVR2_RC1_README.md). Ela é distinta da versão oficial do OpenXR Toolkit.
+
 # OpenXR Toolkit
 
 This software provides a collection of useful features to customize and improve existing OpenXR applications,

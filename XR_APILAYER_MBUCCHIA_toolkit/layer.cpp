@@ -86,6 +86,11 @@ namespace {
     bool ReadFovCalibration(const std::filesystem::path& path,
                             const std::string& identity,
                             XrFovf (&fov)[utilities::ViewCount]) {
+        std::error_code fileError;
+        const auto fileSize = std::filesystem::file_size(path, fileError);
+        if (fileError || fileSize > 4096) {
+            return false;
+        }
         std::ifstream input(path);
         std::string version;
         std::string storedIdentity;
@@ -695,6 +700,9 @@ namespace {
                     cropReason = "off";
                 } else if (viewCount != utilities::ViewCount) {
                     cropReason = "unsupported_view_count";
+                } else if (m_runtimeRecommendedWidth[0] < 2 || m_runtimeRecommendedHeight[0] < 2 ||
+                           m_runtimeRecommendedWidth[1] < 2 || m_runtimeRecommendedHeight[1] < 2) {
+                    cropReason = "invalid_runtime_recommendation";
                 } else if (m_configManager->peekEnumValue<config::ScalingType>(config::SettingScalingType) !=
                            config::ScalingType::None) {
                     cropReason = "upscaling_conflict";
@@ -1110,6 +1118,8 @@ namespace {
                         menuInfo.isVisibilityMaskOverrideSupported = !m_isOpenComposite && m_hasVisibilityMaskKHR;
                         menuInfo.isCACorrectionNeed = m_configManager->isDeveloper() || m_systemName == "AERO" ||
                                                       m_configManager->getValue("allow_ca_correction");
+                        menuInfo.cropActive = m_cropActive;
+                        menuInfo.cropExact = m_cropExact;
                         menuInfo.runtimeName = m_runtimeName;
 
                         m_menuHandler = menu::CreateMenuHandler(m_configManager, m_graphicsDevice, menuInfo);
@@ -1142,8 +1152,8 @@ namespace {
                     m_isActionSetUsed = false;
                     m_isActionSetAttached = false;
                     m_isEyeActionSetSynced = false;
-                    m_diagnosticSyncCalls = 0;
-                    m_diagnosticFrames = 0;
+                    m_lastSyncError = XR_SUCCESS;
+                    m_artificialActionsLogged = false;
                     m_cropFovLogged = false;
                     m_cropCalibrationChecked = false;
                     m_cropInvalidFovLogged = false;
@@ -2245,18 +2255,6 @@ namespace {
 
             XrActionsSyncInfo chainSyncInfo = *syncInfo;
             std::vector<XrActiveActionSet> newActiveActionSets;
-            const uint64_t syncNumber = ++m_diagnosticSyncCalls;
-            const bool sampleSync = syncNumber <= 180 || syncNumber % 600 == 0;
-            if (sampleSync) {
-                DiagnosticLog("xrSyncActions begin call=%llu session=%p original_count=%u eye_set=%p used=%u",
-                              static_cast<unsigned long long>(syncNumber), session, syncInfo->countActiveActionSets,
-                              m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE, m_isActionSetUsed);
-                for (uint32_t i = 0; i < syncInfo->countActiveActionSets; ++i) {
-                    DiagnosticLog("xrSyncActions original[%u]=%p path=%s", i,
-                                  syncInfo->activeActionSets[i].actionSet,
-                                  getPath(syncInfo->activeActionSets[i].subactionPath).c_str());
-                }
-            }
             if (m_eyeTracker && isVrSession(session)) {
                 const auto eyeTrackerActionSet = m_eyeTracker->getActionSet();
                 if (eyeTrackerActionSet != XR_NULL_HANDLE && (!m_isOpenComposite || m_isActionSetAttached)) {
@@ -2276,12 +2274,13 @@ namespace {
 
             const XrResult result =
                 chainSyncInfo.countActiveActionSets ? OpenXrApi::xrSyncActions(session, &chainSyncInfo) : XR_SUCCESS;
-            if (sampleSync || XR_FAILED(result)) {
-                DiagnosticLog("xrSyncActions end call=%llu session=%p result=%s forwarded_count=%u eye_included=%u",
-                              static_cast<unsigned long long>(syncNumber), session, xr::ToCString(result),
+            if (XR_FAILED(result) && result != m_lastSyncError) {
+                DiagnosticLog("xrSyncActions failure session=%p result=%s forwarded_count=%u eye_included=%u",
+                              session, xr::ToCString(result),
                               chainSyncInfo.countActiveActionSets,
                               chainSyncInfo.countActiveActionSets != syncInfo->countActiveActionSets);
             }
+            m_lastSyncError = result;
             if (XR_SUCCEEDED(result) && isVrSession(session) &&
                 chainSyncInfo.countActiveActionSets != syncInfo->countActiveActionSets && !m_isEyeActionSetSynced) {
                 m_isEyeActionSetSynced = true;
@@ -2658,10 +2657,11 @@ namespace {
                 if (m_eyeTracker || m_handTracker) {
                     // Force artifical syncing of actions if the app doesn't seem to use actions.
                     if (!m_isActionSetUsed && !m_isOpenComposite) {
-                        if (m_diagnosticFrames++ < 12) {
+                        if (!m_artificialActionsLogged) {
                             DiagnosticLog("xrBeginFrame artificial_actions session=%p attached=%u eye_set=%p",
                                           session, m_isActionSetAttached,
                                           m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE);
+                            m_artificialActionsLogged = true;
                         }
                         if (m_eyeTracker && m_eyeTracker->getActionSet() != XR_NULL_HANDLE) {
                             if (!m_isActionSetAttached) {
@@ -3900,8 +3900,8 @@ namespace {
         bool m_isActionSetUsed{false};
         bool m_isActionSetAttached{false};
         bool m_isEyeActionSetSynced{false};
-        uint64_t m_diagnosticSyncCalls{0};
-        uint32_t m_diagnosticFrames{0};
+        XrResult m_lastSyncError{XR_SUCCESS};
+        bool m_artificialActionsLogged{false};
         bool m_needVarjoPollEventWorkaround{false};
         std::shared_ptr<input::IHandTracker> m_handTracker;
 

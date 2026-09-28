@@ -8,6 +8,7 @@ on:
       - fix/opencomposite-eye-actions
       - feature/crop-resolution-to-fov-v1
       - feature/crop-resolution-to-fov-v2
+      - release/psvr2-toolkit-rc1
 
 jobs:
   build:
@@ -54,19 +55,43 @@ jobs:
       - name: Restore NuGet packages
         shell: pwsh
         run: nuget restore OpenXR-Toolkit.sln
-      - name: Build unsigned x64 diagnostic layer
+      - name: Build unsigned x64 RC1 layer
         shell: pwsh
         run: msbuild OpenXR-Toolkit.sln /t:XR_APILAYER_MBUCCHIA_toolkit /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v142
-      - name: Verify output
+      - name: Stage RC1 release files
         shell: pwsh
         run: |
           $out = 'bin/x64/Release'
-          if (-not (Test-Path "$out/XR_APILAYER_MBUCCHIA_toolkit.dll")) { throw 'Diagnostic DLL missing' }
-          if (-not (Test-Path "$out/XR_APILAYER_MBUCCHIA_toolkit.json")) { throw 'API layer manifest missing' }
-          Copy-Item docs/DIAGNOSTIC_INSTALL.md "$out/DIAGNOSTIC_INSTALL.md"
-          git rev-parse HEAD | Set-Content "$out/BUILD_COMMIT.txt"
+          $release = 'release-output/OpenXR-Toolkit-PSVR2-RC1-x64'
+          New-Item -ItemType Directory -Path "$release/shaders" -Force | Out-Null
+
+          $runtimeFiles = @(
+            'XR_APILAYER_MBUCCHIA_toolkit.dll',
+            'XR_APILAYER_MBUCCHIA_toolkit.json',
+            'aSeeVRClient.dll', 'jsoncpp.dll', 'libzmq-mt-4_3_3.dll',
+            'Install-Layer.ps1', 'Uninstall-Layer.ps1'
+          )
+          foreach ($file in $runtimeFiles) {
+            $source = Join-Path $out $file
+            if (-not (Test-Path -LiteralPath $source)) { throw "Required release file missing: $file" }
+            Copy-Item -LiteralPath $source -Destination $release
+          }
+
+          $shaderFiles = @(
+            'CAS.hlsl', 'FSR.hlsl', 'NIS.hlsl', 'VRS.hlsl', 'postprocess.hlsl',
+            'ffx_a.h', 'ffx_cas.h', 'ffx_fsr1.h', 'NIS_Scaler.h'
+          )
+          foreach ($file in $shaderFiles) {
+            $source = Join-Path "$out/shaders" $file
+            if (-not (Test-Path -LiteralPath $source)) { throw "Required shader file missing: $file" }
+            Copy-Item -LiteralPath $source -Destination "$release/shaders"
+          }
+
+          Copy-Item -LiteralPath 'docs/PSVR2_RC1_README.md' -Destination "$release/README.md"
+          Copy-Item -LiteralPath 'LICENSE' -Destination $release
+          git rev-parse HEAD | Set-Content "$release/BUILD_COMMIT.txt"
       - uses: actions/upload-artifact@v4
         with:
-          name: PSVR2-Eye-Diagnostic-x64
-          path: bin/x64/Release/
+          name: OpenXR-Toolkit-PSVR2-RC1-x64
+          path: release-output/OpenXR-Toolkit-PSVR2-RC1-x64/
           if-no-files-found: error

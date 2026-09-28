@@ -1,14 +1,21 @@
-# Status
+# Status — OpenXR Toolkit PSVR2 RC1
 
-## Phase 1 — Eye Action lifecycle: validated
+## Concluído
 
-- Stable branch: `fix/opencomposite-eye-actions`.
-- Functionally validated code commit: `7cde664cf201f586ecac1349d69faed9f9000933` (`fix: gate OpenComposite eye gaze on attach and sync`).
-- Windows CI: [`PSVR2 eye tracking diagnostic` run 36370147739](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/actions/runs/36370147739) completed successfully for that commit; artifact: `PSVR2-Eye-Diagnostic-x64`. The workflow writes `BUILD_COMMIT.txt` into the artifact.
-- COMPOUND Demo / OpenComposite: game opens and session remains stable; eye set attaches with OpenComposite sets, sync includes it, `eye_set_ready` follows attach and sync, action pose is active, space location succeeds, projected gaze changes with eye movement, and ETFR works. Neither `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED` nor `XR_ERROR_ACTIONSET_NOT_ATTACHED` occurs.
-- Gunman Contracts / native OpenXR (`opencomposite=0`): game opens, eye set attaches and syncs, action pose becomes active after the first sync, space location succeeds, projected gaze changes, and ETFR works. No regression or `XR_ERROR` was observed in the log.
-- The V1 attach timing bug and V2 early gaze query are resolved. See `RESEARCH_NOTES.md` for the lifecycle explanation and `TEST_MATRIX.md` for the validated cases.
+- **Eye Tracking/OpenComposite: RESOLVIDO.** Attach e sync do Eye ActionSet na ordem correta, sem regressão observada no OpenXR nativo.
+- **Crop Resolution to FOV V1: VALIDADO** como etapa funcional e instrumentada.
+- **Exact Crop V2 e calibração persistente: VALIDADOS em hardware** no Gunman Contracts/PSVR2/SteamVR OpenXR.
+- Gunman Contracts: Eye Tracking, ETFR e Exact Crop funcionam com FOV 90%; 3400×3468 original, 2756×2872 entregue e aceita (~67,1% dos pixels, ~32,9% de redução). Nenhum `XR_ERROR` observado.
+- COMPOUND Demo/OpenComposite: Eye Tracking e ETFR validados na fase 1; V2 instalada, abre sem popup/crash no sanity check.
 
-## Phase 2 — CROP RESOLUTION TO FOV: next objective
+## Release candidate
 
-Research and design only so far. No Crop Resolution to FOV implementation exists in this phase. See `NEXT_STEPS.md`.
+Branch `release/psvr2-toolkit-rc1`, baseada em V2 `9d132cd63425831266b589b5cda7e7f4149822a5`. A RC1 reduz logs por frame, acrescenta estado Exact/Calibration pending no menu, protege a leitura do cache e produz o artifact `OpenXR-Toolkit-PSVR2-RC1-x64` com DLL, manifesto, dependências, shaders, scripts e documentação. `BUILD_COMMIT.txt` identifica a build.
+
+## Limites conhecidos
+
+- A aplicação pode ignorar `recommendedImageRectWidth/Height`; o Toolkit só informa `accepted`, `ignored` ou `custom_or_undetermined` no log.
+- A primeira execução com Crop On usa fallback linear. Reinicie o jogo para aplicar Exact após salvar calibração; alterações de FOV/Crop também exigem reinício.
+- FOV Advanced, upscalers FSR/NIS/CAS e override manual de resolução não são combinados com Crop.
+- Recomendações são calculadas por olho. Apps com um único texture array podem escolher tamanho próprio; o log informa se ele comporta o máximo dos dois olhos.
+- O sanity check da V2 no COMPOUND não prova aceitação da recomendação exata nem ganho de desempenho. A RC1 ainda precisa de teste final em hardware e em outros jogos.

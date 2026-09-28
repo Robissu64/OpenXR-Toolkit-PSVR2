@@ -152,7 +152,8 @@ namespace {
               m_isEyeTrackingSupported(menuInfo.isEyeTrackingSupported),
               m_resolutionHeightRatio(menuInfo.resolutionHeightRatio),
               m_isMotionReprojectionRateSupported(menuInfo.isMotionReprojectionRateSupported),
-              m_displayRefreshRate(menuInfo.displayRefreshRate) {
+              m_displayRefreshRate(menuInfo.displayRefreshRate),
+              m_cropActive(menuInfo.cropActive), m_cropExact(menuInfo.cropExact) {
             m_lastInput = std::chrono::steady_clock::now();
 
             // We display the hint for menu hotkeys for the first few runs.
@@ -1795,7 +1796,13 @@ namespace {
                                      SettingCropResolutionToFOV,
                                      0,
                                      MenuEntry::LastVal<OffOnType>(),
-                                     MenuEntry::FmtEnum<OffOnType>});
+                                     [this](int value) {
+                                         if (!value) return std::string("Off");
+                                         if (!m_originalCropResolutionToFOV) return std::string("On (Restart game)");
+                                         if (!m_cropActive) return std::string("On (Inactive; see log)");
+                                         return m_cropExact ? std::string("On (Exact)")
+                                                            : std::string("On (Calibration pending)");
+                                     }});
             MenuGroup fovSimpleGroup(this, [&] {
                 return m_configManager->peekEnumValue<FovModeType>(SettingFOVType) == FovModeType::Simple;
             });
@@ -2158,7 +2165,7 @@ namespace {
                 m_configManager->peekValue(SettingFOVLeftLeft), m_configManager->peekValue(SettingFOVLeftRight),
                 m_configManager->peekValue(SettingFOVRightLeft), m_configManager->peekValue(SettingFOVRightRight)};
             return (m_originalCropResolutionToFOV || m_configManager->peekValue(SettingCropResolutionToFOV)) &&
-                   (m_originalCropResolutionToFOV != m_configManager->peekValue(SettingCropResolutionToFOV) ||
+                   (m_originalCropResolutionToFOV != !!m_configManager->peekValue(SettingCropResolutionToFOV) ||
                     m_originalFOVType != m_configManager->peekValue(SettingFOVType) ||
                     m_originalFOV != m_configManager->peekValue(SettingFOV) ||
                     m_originalAdvancedFOV != currentAdvancedFOV);
@@ -2217,6 +2224,8 @@ namespace {
         bool m_originalMotionReprojectionEnabled{false};
         bool m_needRestart{false};
         bool m_originalCropResolutionToFOV{false};
+        bool m_cropActive{false};
+        bool m_cropExact{false};
         int m_originalFOVType{0};
         int m_originalFOV{100};
         std::array<int, 6> m_originalAdvancedFOV{};

@@ -27,10 +27,10 @@
 namespace toolkit {
 
     const std::string LayerPrettyName = "OpenXR-Toolkit";
-    const std::string LayerPrettyNameFull = "OpenXR Toolkit - Unreleased (v0.0.0)";
+    const std::string LayerPrettyNameFull = "OpenXR Toolkit PSVR2 - RC1";
 
     const std::string LayerName = "XR_APILAYER_MBUCCHIA_toolkit";
-    const std::string VersionString = "Unreleased";
+    const std::string VersionString = "PSVR2 RC1";
     const std::string RegPrefix = "SOFTWARE\\OpenXR_Toolkit";
 
     // Singleton accessor.
