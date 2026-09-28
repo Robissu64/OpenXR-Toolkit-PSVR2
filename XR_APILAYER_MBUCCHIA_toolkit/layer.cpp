@@ -1599,7 +1599,7 @@ namespace {
                 if (!actionSetsAttached && toolkitBinding) {
                     if (isToolkitEyeBinding) {
                         mergedBindings = m_appEyeGazeBindings;
-                    } else {
+                    } else if (suggestedBindings->countSuggestedBindings) {
                         mergedBindings.assign(suggestedBindings->suggestedBindings,
                                               suggestedBindings->suggestedBindings + suggestedBindings->countSuggestedBindings);
                     }
@@ -1630,8 +1630,12 @@ namespace {
                     if (isToolkitEyeBinding) {
                         m_toolkitEyeGazeBinding = toolkitBinding;
                     } else {
-                        m_appEyeGazeBindings.assign(suggestedBindings->suggestedBindings,
-                                                    suggestedBindings->suggestedBindings + suggestedBindings->countSuggestedBindings);
+                        if (suggestedBindings->countSuggestedBindings) {
+                            m_appEyeGazeBindings.assign(suggestedBindings->suggestedBindings,
+                                                        suggestedBindings->suggestedBindings + suggestedBindings->countSuggestedBindings);
+                        } else {
+                            m_appEyeGazeBindings.clear();
+                        }
                     }
                 }
                 if (appBindingCount && toolkitBinding && !actionSetsAttached) {
