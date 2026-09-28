@@ -2308,7 +2308,7 @@ namespace {
 
                 if (m_eyeTracker || m_handTracker) {
                     // Force artifical syncing of actions if the app doesn't seem to use actions.
-                    if (!m_isActionSetUsed) {
+                    if (!m_isActionSetUsed && !m_isOpenComposite) {
                         if (m_diagnosticFrames++ < 12) {
                             DiagnosticLog("xrBeginFrame artificial_actions session=%p attached=%u eye_set=%p",
                                           session, m_isActionSetAttached,
