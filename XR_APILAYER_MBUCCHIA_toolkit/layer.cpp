@@ -51,6 +51,10 @@ namespace {
     struct SwapchainState {
         std::vector<SwapchainImages> images;
         uint32_t acquiredImageIndex{0};
+        uint32_t requestedWidth{0};
+        uint32_t requestedHeight{0};
+        uint32_t requestedArraySize{0};
+        bool cropRecommendationLogged[utilities::ViewCount]{false, false};
         bool delayedRelease{false};
 
         // Intermediate textures for processing.
@@ -180,6 +184,7 @@ namespace {
             m_configManager->setDefault(config::SettingICD, 1000);
             m_configManager->setDefault(config::SettingFOVType, 0); // Simple
             m_configManager->setDefault(config::SettingFOV, 100);
+            m_configManager->setDefault(config::SettingCropResolutionToFOV, 0);
             m_configManager->setDefault(config::SettingFOVUp, 100);
             m_configManager->setDefault(config::SettingFOVDown, 100);
             m_configManager->setDefault(config::SettingFOVLeftLeft, 100);
@@ -437,6 +442,16 @@ namespace {
                                                                          &viewCount,
                                                                          views));
 
+                m_cropActive = false;
+                m_cropEnumerationLogged = false;
+                for (uint32_t eye = 0; eye < std::min(viewCount, utilities::ViewCount); eye++) {
+                    m_runtimeRecommendedWidth[eye] = views[eye].recommendedImageRectWidth;
+                    m_runtimeRecommendedHeight[eye] = views[eye].recommendedImageRectHeight;
+                    Log("[FOV-CROP] runtime eye=%u recommended=%ux%u max=%ux%u\n",
+                        eye, views[eye].recommendedImageRectWidth, views[eye].recommendedImageRectHeight,
+                        views[eye].maxImageRectWidth, views[eye].maxImageRectHeight);
+                }
+
                 m_displayWidth = views[0].recommendedImageRectWidth;
                 m_displayHeight = views[0].recommendedImageRectHeight;
 
@@ -560,6 +575,51 @@ namespace {
                     Log("Overriding OpenXR resolution: %ux%u\n", m_displayWidth, m_displayHeight);
                 }
 
+                m_cropFovPercent = m_configManager->peekValue(config::SettingFOV);
+                const bool cropRequested = m_configManager->peekValue(config::SettingCropResolutionToFOV);
+                const char* cropReason = "active";
+                if (!cropRequested) {
+                    cropReason = "off";
+                } else if (viewCount != utilities::ViewCount) {
+                    cropReason = "unsupported_view_count";
+                } else if (m_configManager->peekEnumValue<config::ScalingType>(config::SettingScalingType) !=
+                           config::ScalingType::None) {
+                    cropReason = "upscaling_conflict";
+                } else if (m_configManager->peekValue(config::SettingResolutionOverride)) {
+                    cropReason = "resolution_override_conflict";
+                } else if (m_configManager->peekValue(config::SettingFOVType) != 0) {
+                    cropReason = "advanced_fov_unsupported";
+                } else if (m_cropFovPercent < 50 || m_cropFovPercent > 100) {
+                    cropReason = "invalid_fov_percent";
+                } else if (m_cropFovPercent == 100) {
+                    cropReason = "fov_not_reduced";
+                } else {
+                    m_cropActive = true;
+                    m_displayWidth = m_displayHeight = 0;
+                    for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                        const auto [cropWidth, cropHeight] =
+                            config::GetScaledDimensions(m_cropFovPercent, -1, m_runtimeRecommendedWidth[eye],
+                                                        m_runtimeRecommendedHeight[eye], 2);
+                        m_displayWidth = std::max(m_displayWidth, cropWidth);
+                        m_displayHeight = std::max(m_displayHeight, cropHeight);
+                    }
+                }
+                const float widthRatio = m_cropActive ? static_cast<float>(m_displayWidth) /
+                                                           m_runtimeRecommendedWidth[0]
+                                                      : 1.f;
+                const float heightRatio = m_cropActive ? static_cast<float>(m_displayHeight) /
+                                                            m_runtimeRecommendedHeight[0]
+                                                       : 1.f;
+                Log("[FOV-CROP] app=%s opencomposite=%u requested=%u active=%u reason=%s fov_type=%d "
+                    "scaling_type=%d resolution_override=%u fov_percent=%d delivered=%ux%u "
+                    "widthRatio=%.4f heightRatio=%.4f relativePixels=%.4f\n",
+                    m_applicationName.c_str(), m_isOpenComposite, cropRequested, m_cropActive, cropReason,
+                    m_configManager->peekValue(config::SettingFOVType),
+                    static_cast<int>(m_configManager->peekEnumValue<config::ScalingType>(config::SettingScalingType)),
+                    m_configManager->peekValue(config::SettingResolutionOverride), m_cropFovPercent,
+                    m_displayWidth, m_displayHeight, widthRatio, heightRatio,
+                    widthRatio * heightRatio);
+
                 // Remember the XrSystemId to use.
                 m_vrSystemId = *systemId;
 
@@ -584,6 +644,10 @@ namespace {
 
             const XrResult result = OpenXrApi::xrEnumerateViewConfigurationViews(
                 instance, systemId, viewConfigurationType, viewCapacityInput, viewCountOutput, views);
+            if (XR_SUCCEEDED(result) && m_cropActive &&
+                viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+                return result;
+            }
             if (XR_SUCCEEDED(result) && isVrSystem(systemId) && views) {
                 // Determine the application resolution.
                 // If a session is active, we use the values latched at session creation. Some applications like Unreal
@@ -624,6 +688,16 @@ namespace {
                 for (uint32_t i = 0; i < *viewCountOutput; i++) {
                     views[i].recommendedImageRectWidth = inputWidth;
                     views[i].recommendedImageRectHeight = inputHeight;
+                }
+                if (!m_cropEnumerationLogged) {
+                    for (uint32_t eye = 0; eye < std::min(*viewCountOutput, utilities::ViewCount); eye++) {
+                        Log("[FOV-CROP] xrEnumerateViewConfigurationViews eye=%u raw=%ux%u delivered=%ux%u "
+                            "active=%u fov_percent=%d\n",
+                            eye, m_runtimeRecommendedWidth[eye], m_runtimeRecommendedHeight[eye],
+                            views[eye].recommendedImageRectWidth, views[eye].recommendedImageRectHeight,
+                            m_cropActive, m_cropFovPercent);
+                    }
+                    m_cropEnumerationLogged = true;
                 }
 
                 static bool atLeastOnce = false;
@@ -906,6 +980,7 @@ namespace {
                     m_isEyeActionSetSynced = false;
                     m_diagnosticSyncCalls = 0;
                     m_diagnosticFrames = 0;
+                    m_cropFovLogged = false;
 
                     // Remember the XrSession to use.
                     m_vrSession = *session;
@@ -1092,6 +1167,11 @@ namespace {
                 createInfo->sampleCount,
                 createInfo->format,
                 createInfo->usageFlags);
+            Log("[FOV-CROP] xrCreateSwapchain session=%p requested=%ux%u arraySize=%u format=%lld "
+                "sampleCount=%u usageFlags=0x%llx depth=%u crop_active=%u\n",
+                session, createInfo->width, createInfo->height, createInfo->arraySize,
+                static_cast<long long>(createInfo->format), createInfo->sampleCount,
+                static_cast<unsigned long long>(createInfo->usageFlags), isDepth, m_cropActive);
 
             XrSwapchainCreateInfo chainCreateInfo = *createInfo;
             if (!isDepth) {
@@ -1120,6 +1200,9 @@ namespace {
                 CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(*swapchain, 0, &imageCount, nullptr));
 
                 SwapchainState swapchainState;
+                swapchainState.requestedWidth = createInfo->width;
+                swapchainState.requestedHeight = createInfo->height;
+                swapchainState.requestedArraySize = createInfo->arraySize;
                 int64_t overrideFormat = 0;
                 if (m_graphicsDevice->getApi() == graphics::Api::D3D11) {
                     std::vector<XrSwapchainImageD3D11KHR> d3dImages(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
@@ -1235,6 +1318,14 @@ namespace {
                 }
 
                 m_swapchains.insert_or_assign(*swapchain, swapchainState);
+
+                const auto appInfo = swapchainState.images[0].appTexture->getInfo();
+                const auto runtimeInfo = swapchainState.images[0].runtimeTexture->getInfo();
+                Log("[FOV-CROP] xrCreateSwapchain result=%s swapchain=%p forwarded=%ux%u "
+                    "appTexture=%ux%u arraySize=%u runtimeTexture=%ux%u arraySize=%u\n",
+                    xr::ToCString(result), *swapchain, chainCreateInfo.width, chainCreateInfo.height,
+                    appInfo.width, appInfo.height, appInfo.arraySize,
+                    runtimeInfo.width, runtimeInfo.height, runtimeInfo.arraySize);
 
                 TraceLoggingWrite(g_traceProvider, "xrCreateSwapchain", TLPArg(*swapchain, "Swapchain"));
             }
@@ -1754,6 +1845,8 @@ namespace {
                 assert(*viewCountOutput == utilities::ViewCount);
                 using namespace DirectX;
 
+                const XrFovf originalFov[utilities::ViewCount] = {views[0].fov, views[1].fov};
+
                 m_posesForFrame[0].pose = views[0].pose;
                 m_posesForFrame[1].pose = views[1].pose;
 
@@ -1831,8 +1924,9 @@ namespace {
                 }
 
                 // Override the FOV if requested.
-                if (m_configManager->getValue(config::SettingFOVType) == 0) {
-                    const auto fovOverride = m_configManager->getValue(config::SettingFOV);
+                if ((m_cropActive ? 0 : m_configManager->getValue(config::SettingFOVType)) == 0) {
+                    const auto fovOverride = m_cropActive ? m_cropFovPercent :
+                                                           m_configManager->getValue(config::SettingFOV);
                     if (fovOverride != 100) {
                         StoreXrFov(&views[0].fov, LoadXrFov(views[0].fov) * XMVectorReplicate(fovOverride * 0.01f));
                         StoreXrFov(&views[1].fov, LoadXrFov(views[1].fov) * XMVectorReplicate(fovOverride * 0.01f));
@@ -1858,6 +1952,38 @@ namespace {
 
                 m_posesForFrame[0].fov = views[0].fov;
                 m_posesForFrame[1].fov = views[1].fov;
+
+                if (!m_cropFovLogged) {
+                    for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                        const auto& raw = originalFov[eye];
+                        const auto& modified = views[eye].fov;
+                        const float rawWidthSpan = std::tan(raw.angleRight) - std::tan(raw.angleLeft);
+                        const float rawHeightSpan = std::tan(raw.angleUp) - std::tan(raw.angleDown);
+                        const float exactWidthRatio = std::abs(rawWidthSpan) > 0.000001f
+                                                          ? std::abs((std::tan(modified.angleRight) -
+                                                                      std::tan(modified.angleLeft)) / rawWidthSpan)
+                                                          : 0.f;
+                        const float exactHeightRatio = std::abs(rawHeightSpan) > 0.000001f
+                                                           ? std::abs((std::tan(modified.angleUp) -
+                                                                       std::tan(modified.angleDown)) / rawHeightSpan)
+                                                           : 0.f;
+                        const float appliedWidthRatio = m_cropActive
+                                                            ? static_cast<float>(m_displayWidth) /
+                                                                  m_runtimeRecommendedWidth[eye]
+                                                            : 1.f;
+                        const float appliedHeightRatio = m_cropActive
+                                                             ? static_cast<float>(m_displayHeight) /
+                                                                   m_runtimeRecommendedHeight[eye]
+                                                             : 1.f;
+                        Log("[FOV-CROP] xrLocateViews session=%p eye=%u original=%s modified=%s "
+                            "exactWidthRatio=%.4f exactHeightRatio=%.4f v1WidthRatio=%.4f v1HeightRatio=%.4f "
+                            "linearApprox=%.4f\n",
+                            session, eye, xr::ToString(raw).c_str(), xr::ToString(modified).c_str(),
+                            exactWidthRatio, exactHeightRatio, appliedWidthRatio, appliedHeightRatio,
+                            m_cropActive ? m_cropFovPercent * 0.01f : 1.f);
+                    }
+                    m_cropFovLogged = true;
+                }
 
                 // Apply zoom if requested.
                 const auto zoom = m_configManager->getValue(config::SettingZoom);
@@ -2762,6 +2888,33 @@ namespace {
                         }
                         auto& swapchainState = swapchainIt->second;
                         auto& swapchainImages = swapchainState.images[swapchainState.acquiredImageIndex];
+                        if (m_cropActive && !swapchainState.cropRecommendationLogged[eye]) {
+                            const uint32_t expectedWidth = m_displayWidth * (useDoubleWide ? 2 : 1);
+                            const uint32_t originalWidth = m_runtimeRecommendedWidth[eye] *
+                                                           (useDoubleWide ? 2 : 1);
+                            const bool targetRect = view.subImage.imageRect.extent.width == m_displayWidth &&
+                                                    view.subImage.imageRect.extent.height == m_displayHeight;
+                            const bool originalRect =
+                                view.subImage.imageRect.extent.width == m_runtimeRecommendedWidth[eye] &&
+                                view.subImage.imageRect.extent.height == m_runtimeRecommendedHeight[eye];
+                            const bool targetTexture = swapchainState.requestedWidth == expectedWidth &&
+                                                       swapchainState.requestedHeight == m_displayHeight;
+                            const bool originalTexture = swapchainState.requestedWidth == originalWidth &&
+                                                         swapchainState.requestedHeight ==
+                                                             m_runtimeRecommendedHeight[eye];
+                            const char* status = targetRect && targetTexture ? "accepted"
+                                                 : originalRect && originalTexture ? "ignored"
+                                                                                   : "custom_or_undetermined";
+                            Log("[FOV-CROP] crop recommendation %s session=%p swapchain=%p eye=%u layout=%s "
+                                "arraySize=%u requested=%ux%u imageRect=%s recommended=%ux%u raw=%ux%u\n",
+                                status, session, view.subImage.swapchain, eye,
+                                useTextureArrays ? "texture_array" : useDoubleWide ? "double_wide" : "separate_eye",
+                                swapchainState.requestedArraySize, swapchainState.requestedWidth,
+                                swapchainState.requestedHeight, xr::ToString(view.subImage.imageRect).c_str(),
+                                m_displayWidth, m_displayHeight, m_runtimeRecommendedWidth[eye],
+                                m_runtimeRecommendedHeight[eye]);
+                            swapchainState.cropRecommendationLogged[eye] = true;
+                        }
 
                         // Look for the depth buffer.
                         std::shared_ptr<graphics::ITexture> depthBuffer;
@@ -3002,7 +3155,8 @@ namespace {
 
                         // Patch the FOV if it was overriden.
                         const auto fovOverrideMode = m_configManager->peekValue(config::SettingFOVType);
-                        if ((fovOverrideMode == 0 && m_configManager->peekValue(config::SettingFOV) != 100) ||
+                        if (m_cropActive ||
+                            (fovOverrideMode == 0 && m_configManager->peekValue(config::SettingFOV) != 100) ||
                             fovOverrideMode == 1 || m_configManager->peekValue(config::SettingZoom) != 10) {
                             const bool yflip = correctedProjectionViews[eye].fov.angleDown > 0 &&
                                                correctedProjectionViews[eye].fov.angleUp < 0;
@@ -3470,6 +3624,12 @@ namespace {
         XrSession m_vrSession{XR_NULL_HANDLE};
         uint32_t m_displayWidth{0};
         uint32_t m_displayHeight{0};
+        uint32_t m_runtimeRecommendedWidth[utilities::ViewCount]{};
+        uint32_t m_runtimeRecommendedHeight[utilities::ViewCount]{};
+        int m_cropFovPercent{100};
+        bool m_cropActive{false};
+        bool m_cropEnumerationLogged{false};
+        bool m_cropFovLogged{false};
         float m_resolutionHeightRatio{1.f};
         uint32_t m_maxDisplayHeight{0};
         bool m_supportHandTracking{false};

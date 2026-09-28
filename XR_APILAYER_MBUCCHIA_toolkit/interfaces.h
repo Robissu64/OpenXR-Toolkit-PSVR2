@@ -135,6 +135,7 @@ namespace toolkit {
         const std::string SettingICD = "world_scale";
         const std::string SettingFOVType = "fov_type";
         const std::string SettingFOV = "fov";
+        const std::string SettingCropResolutionToFOV = "crop_resolution_to_fov";
         const std::string SettingFOVUp = "fov_up";
         const std::string SettingFOVDown = "fov_down";
         const std::string SettingFOVLeftLeft = "fov_ll";

@@ -320,6 +320,14 @@ namespace {
 
                     // When changing some settings, display the warning that the session must be restarted.
                     const bool wasRestartNeeded = std::exchange(m_needRestart, checkNeedRestartCondition());
+                    if (previousValue != peekEntryValue(menuEntry) && isCropRestartNeeded() &&
+                        (menuEntry.configName == SettingCropResolutionToFOV || menuEntry.configName == SettingFOV ||
+                         menuEntry.configName == SettingFOVType || menuEntry.configName == SettingFOVUp ||
+                         menuEntry.configName == SettingFOVDown || menuEntry.configName == SettingFOVLeftLeft ||
+                         menuEntry.configName == SettingFOVLeftRight || menuEntry.configName == SettingFOVRightLeft ||
+                         menuEntry.configName == SettingFOVRightRight)) {
+                        Log("[FOV-CROP] setting changed during session; restart the game to apply the resolution\n");
+                    }
 
                     // When switching tab, changing the font size, switching expert menu or displaying the restart
                     // banner, force re-alignment/re-size.
@@ -723,7 +731,9 @@ namespace {
                     } else if (m_needRestart) {
                         top += fontSize;
 
-                        left += m_device->drawString(L"\x26A0  Restart the VR session to apply changes  \x26A0",
+                        left += m_device->drawString(isCropRestartNeeded()
+                                                         ? L"\x26A0  Restart the game to apply Crop Resolution  \x26A0"
+                                                         : L"\x26A0  Restart the VR session to apply changes  \x26A0",
                                                      TextStyle::Bold,
                                                      fontSize,
                                                      leftAlign,
@@ -1770,6 +1780,22 @@ namespace {
                                      0,
                                      MenuEntry::LastVal<FovModeType>(),
                                      MenuEntry::FmtEnum<FovModeType>});
+            m_originalCropResolutionToFOV = m_configManager->peekValue(SettingCropResolutionToFOV);
+            m_originalFOVType = m_configManager->peekValue(SettingFOVType);
+            m_originalFOV = m_configManager->peekValue(SettingFOV);
+            m_originalAdvancedFOV = {m_configManager->peekValue(SettingFOVUp),
+                                     m_configManager->peekValue(SettingFOVDown),
+                                     m_configManager->peekValue(SettingFOVLeftLeft),
+                                     m_configManager->peekValue(SettingFOVLeftRight),
+                                     m_configManager->peekValue(SettingFOVRightLeft),
+                                     m_configManager->peekValue(SettingFOVRightRight)};
+            m_menuEntries.push_back({MenuIndent::OptionIndent,
+                                     "Crop Resolution to FOV",
+                                     MenuEntryType::Choice,
+                                     SettingCropResolutionToFOV,
+                                     0,
+                                     MenuEntry::LastVal<OffOnType>(),
+                                     MenuEntry::FmtEnum<OffOnType>});
             MenuGroup fovSimpleGroup(this, [&] {
                 return m_configManager->peekEnumValue<FovModeType>(SettingFOVType) == FovModeType::Simple;
             });
@@ -2100,6 +2126,9 @@ namespace {
         }
 
         bool checkNeedRestartCondition() const {
+            if (isCropRestartNeeded()) {
+                return true;
+            }
             if (m_originalHandTrackingEnabled != isHandTrackingEnabled() ||
                 m_originalScalingType != getCurrentScalingType() ||
                 m_originalEyeTrackingEnabled != isEyeTrackingEnabled()) {
@@ -2121,6 +2150,18 @@ namespace {
             }
 
             return false;
+        }
+
+        bool isCropRestartNeeded() const {
+            const std::array<int, 6> currentAdvancedFOV = {
+                m_configManager->peekValue(SettingFOVUp), m_configManager->peekValue(SettingFOVDown),
+                m_configManager->peekValue(SettingFOVLeftLeft), m_configManager->peekValue(SettingFOVLeftRight),
+                m_configManager->peekValue(SettingFOVRightLeft), m_configManager->peekValue(SettingFOVRightRight)};
+            return (m_originalCropResolutionToFOV || m_configManager->peekValue(SettingCropResolutionToFOV)) &&
+                   (m_originalCropResolutionToFOV != m_configManager->peekValue(SettingCropResolutionToFOV) ||
+                    m_originalFOVType != m_configManager->peekValue(SettingFOVType) ||
+                    m_originalFOV != m_configManager->peekValue(SettingFOV) ||
+                    m_originalAdvancedFOV != currentAdvancedFOV);
         }
 
         const std::shared_ptr<IConfigManager> m_configManager;
@@ -2175,6 +2216,10 @@ namespace {
         int m_originalResolutionHeight{0};
         bool m_originalMotionReprojectionEnabled{false};
         bool m_needRestart{false};
+        bool m_originalCropResolutionToFOV{false};
+        int m_originalFOVType{0};
+        int m_originalFOV{100};
+        std::array<int, 6> m_originalAdvancedFOV{};
 
         mutable MenuState m_state{MenuState::NotVisible};
         mutable float m_menuEntriesTitleWidth{0.0f};
