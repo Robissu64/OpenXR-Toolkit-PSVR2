@@ -218,10 +218,9 @@ namespace {
         void beginSession(XrSession session) override {
             EyeTrackerBase::beginSession(session);
             m_gazeQueries = 0;
-            m_lastGazeActive = false;
             m_firstActiveLogged = false;
-            m_lastPoseError = XR_SUCCESS;
-            m_lastLocateError = XR_SUCCESS;
+            m_poseErrorLogged = false;
+            m_locateErrorLogged = false;
             m_locateValidLogged = false;
             DiagnosticLog("eye beginSession session=%p viewSpace=%p", session, m_viewSpace);
 
@@ -321,20 +320,16 @@ namespace {
                 XrActionStateGetInfo getActionStateInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr};
                 getActionStateInfo.action = m_eyeGazeAction;
                 const XrResult result = m_openXR.xrGetActionStatePose(m_session, &getActionStateInfo, &actionStatePose);
-                if ((XR_FAILED(result) && result != m_lastPoseError) ||
-                    (XR_SUCCEEDED(result) && m_lastGazeActive != !!actionStatePose.isActive)) {
-                    DiagnosticLog("eye xrGetActionStatePose query=%llu session=%p action=%p result=%s isActive=%u",
-                                  static_cast<unsigned long long>(query), m_session, m_eyeGazeAction,
-                                  xr::ToCString(result), actionStatePose.isActive);
+                if (XR_FAILED(result) && !m_poseErrorLogged) {
+                    m_poseErrorLogged = true;
+                    DiagnosticLog("eye xrGetActionStatePose first_error result=%s", xr::ToCString(result));
                 }
-                m_lastPoseError = result;
                 CHECK_XRCMD(result);
                 if (actionStatePose.isActive && !m_firstActiveLogged) {
                     m_firstActiveLogged = true;
                     DiagnosticLog("eye gaze_active first query=%llu session=%p action=%p",
                                   static_cast<unsigned long long>(query), m_session, m_eyeGazeAction);
                 }
-                m_lastGazeActive = !!actionStatePose.isActive;
 
                 if (!actionStatePose.isActive) {
                     return false;
@@ -342,23 +337,20 @@ namespace {
             }
 
             const XrResult locateResult = m_openXR.xrLocateSpace(m_eyeSpace, m_viewSpace, m_frameTime, &location);
-            if ((XR_FAILED(locateResult) && locateResult != m_lastLocateError) ||
-                (XR_SUCCEEDED(locateResult) && Pose::IsPoseValid(location.locationFlags) &&
-                 !m_locateValidLogged)) {
-                DiagnosticLog("eye xrLocateSpace query=%llu result=%s flags=0x%x time=%lld pos=(%.4f,%.4f,%.4f) rot=(%.4f,%.4f,%.4f,%.4f)",
-                              static_cast<unsigned long long>(query), xr::ToCString(locateResult),
-                              static_cast<unsigned int>(location.locationFlags), static_cast<long long>(m_frameTime),
-                              location.pose.position.x, location.pose.position.y, location.pose.position.z,
-                              location.pose.orientation.x, location.pose.orientation.y, location.pose.orientation.z,
-                              location.pose.orientation.w);
+            if (XR_FAILED(locateResult) && !m_locateErrorLogged) {
+                m_locateErrorLogged = true;
+                DiagnosticLog("eye xrLocateSpace first_error result=%s", xr::ToCString(locateResult));
             }
-            m_lastLocateError = locateResult;
             CHECK_XRCMD(locateResult);
 
             if (!Pose::IsPoseValid(location.locationFlags)) {
                 return false;
             }
-            m_locateValidLogged = true;
+            if (!m_locateValidLogged) {
+                m_locateValidLogged = true;
+                DiagnosticLog("eye xrLocateSpace first_valid flags=0x%x",
+                              static_cast<unsigned int>(location.locationFlags));
+            }
 
             if (m_debugWithController) {
                 location.pose.position.x = location.pose.position.y = location.pose.position.z = 0.f;
@@ -385,10 +377,9 @@ namespace {
         XrAction m_eyeGazeAction{XR_NULL_HANDLE};
         XrSpace m_eyeSpace{XR_NULL_HANDLE};
         mutable uint64_t m_gazeQueries{0};
-        mutable bool m_lastGazeActive{false};
         mutable bool m_firstActiveLogged{false};
-        mutable XrResult m_lastPoseError{XR_SUCCESS};
-        mutable XrResult m_lastLocateError{XR_SUCCESS};
+        mutable bool m_poseErrorLogged{false};
+        mutable bool m_locateErrorLogged{false};
         mutable bool m_locateValidLogged{false};
     };
 

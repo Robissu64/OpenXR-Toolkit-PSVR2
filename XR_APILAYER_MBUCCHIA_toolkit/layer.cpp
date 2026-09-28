@@ -1280,7 +1280,8 @@ namespace {
                     m_eyeTracker->endSession();
                 }
                 m_toolkitEyeGazeBinding.reset();
-                m_appEyeGazeBindings.clear();
+                // Suggested application bindings belong to the instance, not the session. A new session can
+                // recreate our gaze action without the application suggesting its bindings again.
                 if (m_menuSwapchain != XR_NULL_HANDLE) {
                     xrDestroySwapchain(m_menuSwapchain);
                     m_menuSwapchain = XR_NULL_HANDLE;
@@ -1571,7 +1572,6 @@ namespace {
             const bool isEyeGazeProfile = interactionProfile == "/interaction_profiles/ext/eye_gaze_interaction";
             const bool isToolkitEyeBinding = isEyeGazeProfile && m_isSuggestingToolkitEyeBinding;
             const bool actionSetsAttached = m_isActionSetUsed || m_isActionSetAttached;
-            const uint64_t eyeBindingOrder = isEyeGazeProfile ? ++m_eyeBindingSuggestionOrder : 0;
 
             TraceLoggingWrite(g_traceProvider,
                               "xrSuggestInteractionProfileBindings",
@@ -1588,20 +1588,10 @@ namespace {
             XrInteractionProfileSuggestedBinding chainSuggestedBindings = *suggestedBindings;
             std::vector<XrActionSuggestedBinding> mergedBindings;
             std::optional<XrActionSuggestedBinding> toolkitBinding = m_toolkitEyeGazeBinding;
+            uint32_t appBindingCount = 0;
             if (isEyeGazeProfile) {
                 if (isToolkitEyeBinding && suggestedBindings->countSuggestedBindings == 1) {
                     toolkitBinding = suggestedBindings->suggestedBindings[0];
-                }
-                DiagnosticLog("eye binding suggest order=%llu origin=%s profile=%s input_count=%u toolkit_action_exists=%u attached=%u",
-                              static_cast<unsigned long long>(eyeBindingOrder),
-                              isToolkitEyeBinding ? "toolkit_internal" : "app_forward",
-                              interactionProfile.c_str(), suggestedBindings->countSuggestedBindings,
-                              toolkitBinding.has_value(), actionSetsAttached);
-                for (uint32_t i = 0; i < suggestedBindings->countSuggestedBindings; ++i) {
-                    DiagnosticLog("eye binding input order=%llu index=%u action=%p binding=%s",
-                                  static_cast<unsigned long long>(eyeBindingOrder), i,
-                                  suggestedBindings->suggestedBindings[i].action,
-                                  getPath(suggestedBindings->suggestedBindings[i].binding).c_str());
                 }
 
                 // Repeated suggestions replace the entire profile. Preserve the latest application list on both
@@ -1613,6 +1603,7 @@ namespace {
                         mergedBindings.assign(suggestedBindings->suggestedBindings,
                                               suggestedBindings->suggestedBindings + suggestedBindings->countSuggestedBindings);
                     }
+                    appBindingCount = static_cast<uint32_t>(mergedBindings.size());
                     const bool alreadyIncluded = std::any_of(
                         mergedBindings.begin(), mergedBindings.end(), [&](const XrActionSuggestedBinding& binding) {
                             return binding.action == toolkitBinding->action && binding.binding == toolkitBinding->binding;
@@ -1623,23 +1614,12 @@ namespace {
                     chainSuggestedBindings.countSuggestedBindings = static_cast<uint32_t>(mergedBindings.size());
                     chainSuggestedBindings.suggestedBindings = mergedBindings.data();
                 }
-                DiagnosticLog("eye binding merge order=%llu app_binding_count=%u toolkit_binding_present=%u merged_count=%u attached=%u",
-                              static_cast<unsigned long long>(eyeBindingOrder),
-                              isToolkitEyeBinding ? static_cast<uint32_t>(m_appEyeGazeBindings.size())
-                                                  : suggestedBindings->countSuggestedBindings,
-                              toolkitBinding.has_value(), chainSuggestedBindings.countSuggestedBindings,
-                              actionSetsAttached);
             }
 
             if (m_configManager->getValue(config::SettingEyeDebugWithController)) {
                 // We must drop calls to allow the controller override for debugging.
                 if (suggestedBindings->countSuggestedBindings > 1 ||
                     interactionProfile != "/interaction_profiles/hp/mixed_reality_controller") {
-                    if (isEyeGazeProfile) {
-                        DiagnosticLog("eye binding result order=%llu origin=%s result=XR_SUCCESS bypassed=1",
-                                      static_cast<unsigned long long>(eyeBindingOrder),
-                                      isToolkitEyeBinding ? "toolkit_internal" : "app_forward");
-                    }
                     return XR_SUCCESS;
                 }
             }
@@ -1654,10 +1634,13 @@ namespace {
                                                     suggestedBindings->suggestedBindings + suggestedBindings->countSuggestedBindings);
                     }
                 }
-                DiagnosticLog("eye binding result order=%llu origin=%s result=%s forwarded_count=%u attached=%u",
-                              static_cast<unsigned long long>(eyeBindingOrder),
-                              isToolkitEyeBinding ? "toolkit_internal" : "app_forward", xr::ToCString(result),
-                              chainSuggestedBindings.countSuggestedBindings, actionSetsAttached);
+                if (appBindingCount && toolkitBinding && !actionSetsAttached) {
+                    DiagnosticLog("eye binding merge app_binding_count=%u toolkit_binding_present=1 merged_count=%u result=%s",
+                                  appBindingCount, chainSuggestedBindings.countSuggestedBindings, xr::ToCString(result));
+                } else if (XR_FAILED(result)) {
+                    DiagnosticLog("eye binding suggestion failed result=%s attached=%u", xr::ToCString(result),
+                                  actionSetsAttached);
+                }
             }
             if (XR_SUCCEEDED(result) && m_handTracker) {
                 m_handTracker->registerBindings(*suggestedBindings);
@@ -1680,13 +1663,6 @@ namespace {
 
             XrSessionActionSetsAttachInfo chainAttachInfo = *attachInfo;
             std::vector<XrActionSet> newActionSets;
-            DiagnosticLog("xrAttachSessionActionSets begin session=%p original_count=%u eye_set=%p used=%u eye_set_attached=%u",
-                          session, attachInfo->countActionSets,
-                          m_eyeTracker ? m_eyeTracker->getActionSet() : XR_NULL_HANDLE,
-                          m_isActionSetUsed, m_isActionSetAttached);
-            for (uint32_t i = 0; i < attachInfo->countActionSets; ++i) {
-                DiagnosticLog("xrAttachSessionActionSets original[%u]=%p", i, attachInfo->actionSets[i]);
-            }
             if (m_eyeTracker && isVrSession(session)) {
                 const auto eyeTrackerActionSet = m_eyeTracker->getActionSet();
                 if (eyeTrackerActionSet != XR_NULL_HANDLE) {
@@ -1708,14 +1684,12 @@ namespace {
                 m_isActionSetUsed = attachInfo->countActionSets > 0;
                 if (chainAttachInfo.countActionSets != attachInfo->countActionSets) {
                     m_isActionSetAttached = true;
-                    DiagnosticLog("eye_set_attached session=%p set=%p app_attach_seen=%u",
-                                  session, m_eyeTracker->getActionSet(), m_isOpenComposite);
                 }
             }
-            DiagnosticLog("xrAttachSessionActionSets end session=%p result=%s forwarded_count=%u eye_included=%u used=%u eye_set_attached=%u",
-                          session, xr::ToCString(result), chainAttachInfo.countActionSets,
+            DiagnosticLog("xrAttachSessionActionSets session=%p result=%s app_count=%u forwarded_count=%u eye_included=%u eye_set_attached=%u",
+                          session, xr::ToCString(result), attachInfo->countActionSets, chainAttachInfo.countActionSets,
                           chainAttachInfo.countActionSets != attachInfo->countActionSets,
-                          m_isActionSetUsed, m_isActionSetAttached);
+                          m_isActionSetAttached);
             return result;
         }
 
@@ -1740,6 +1714,7 @@ namespace {
 
             const XrResult result = OpenXrApi::xrCreateAction(actionSet, createInfo, action);
             if (XR_SUCCEEDED(result)) {
+                m_actionSetByAction[*action] = actionSet;
                 if (m_handTracker) {
                     m_handTracker->registerAction(*action, actionSet);
                 }
@@ -1754,6 +1729,7 @@ namespace {
 
             const XrResult result = OpenXrApi::xrDestroyAction(action);
             if (XR_SUCCEEDED(result)) {
+                m_actionSetByAction.erase(action);
                 m_appEyeGazeBindings.erase(
                     std::remove_if(m_appEyeGazeBindings.begin(), m_appEyeGazeBindings.end(),
                                    [action](const XrActionSuggestedBinding& binding) { return binding.action == action; }),
@@ -1766,6 +1742,31 @@ namespace {
                 }
             }
 
+            return result;
+        }
+
+        XrResult xrDestroyActionSet(XrActionSet actionSet) override {
+            const XrResult result = OpenXrApi::xrDestroyActionSet(actionSet);
+            if (XR_SUCCEEDED(result)) {
+                const auto belongsToSet = [&](XrAction action) {
+                    const auto it = m_actionSetByAction.find(action);
+                    return it != m_actionSetByAction.end() && it->second == actionSet;
+                };
+                m_appEyeGazeBindings.erase(
+                    std::remove_if(m_appEyeGazeBindings.begin(), m_appEyeGazeBindings.end(),
+                                   [&](const XrActionSuggestedBinding& binding) { return belongsToSet(binding.action); }),
+                    m_appEyeGazeBindings.end());
+                if (m_toolkitEyeGazeBinding && belongsToSet(m_toolkitEyeGazeBinding->action)) {
+                    m_toolkitEyeGazeBinding.reset();
+                }
+                for (auto it = m_actionSetByAction.begin(); it != m_actionSetByAction.end();) {
+                    if (it->second == actionSet) {
+                        it = m_actionSetByAction.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             return result;
         }
 
@@ -4007,7 +4008,7 @@ namespace {
         std::shared_ptr<graphics::IFrameAnalyzer> m_frameAnalyzer;
         std::shared_ptr<input::IEyeTracker> m_eyeTracker;
         bool m_isSuggestingToolkitEyeBinding{false};
-        uint64_t m_eyeBindingSuggestionOrder{0};
+        std::map<XrAction, XrActionSet> m_actionSetByAction;
         std::vector<XrActionSuggestedBinding> m_appEyeGazeBindings;
         std::optional<XrActionSuggestedBinding> m_toolkitEyeGazeBinding;
         bool m_isActionSetUsed{false};

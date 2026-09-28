@@ -11,6 +11,7 @@ on:
       - release/psvr2-toolkit-rc1
       - release/v1.0
       - fix/native-openxr-app-owned-eye-extension
+      - release/v1.1-rc
 
 jobs:
   build:
@@ -57,14 +58,19 @@ jobs:
       - name: Restore NuGet packages
         shell: pwsh
         run: nuget restore OpenXR-Toolkit.sln
-      - name: Build unsigned x64 v1.0 layer
+      - name: Build unsigned x64 layer
         shell: pwsh
         run: msbuild OpenXR-Toolkit.sln /t:XR_APILAYER_MBUCCHIA_toolkit /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v142
-      - name: Stage v1.0 release files
+      - name: Stage installation files
         shell: pwsh
         run: |
           $out = 'bin/x64/Release'
-          $release = 'release-output/OpenXR-Toolkit-PSVR2-v1.0-x64'
+          $isV11Rc = $env:GITHUB_REF_NAME -eq 'release/v1.1-rc'
+          $release = if ($isV11Rc) {
+            'release-output/OpenXR-Toolkit-PSVR2-v1.1-RC-x64'
+          } else {
+            'release-output/OpenXR-Toolkit-PSVR2-v1.0-x64'
+          }
           New-Item -ItemType Directory -Path "$release/shaders" -Force | Out-Null
 
           $runtimeFiles = @(
@@ -89,14 +95,16 @@ jobs:
             Copy-Item -LiteralPath $source -Destination "$release/shaders"
           }
 
-          Copy-Item -LiteralPath 'docs/PSVR2_V1_README.md' -Destination "$release/README.md"
-          Copy-Item -LiteralPath 'docs/RELEASE_NOTES_v1.0.md' -Destination "$release/RELEASE_NOTES.md"
+          $readme = if ($isV11Rc) { 'docs/PSVR2_V11_RC_README.md' } else { 'docs/PSVR2_V1_README.md' }
+          $notes = if ($isV11Rc) { 'docs/RELEASE_NOTES_v1.1_RC.md' } else { 'docs/RELEASE_NOTES_v1.0.md' }
+          Copy-Item -LiteralPath $readme -Destination "$release/README.md"
+          Copy-Item -LiteralPath $notes -Destination "$release/RELEASE_NOTES.md"
           Copy-Item -LiteralPath 'scripts/Install.bat' -Destination $release
           Copy-Item -LiteralPath 'scripts/Uninstall.bat' -Destination $release
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
           git rev-parse HEAD | Set-Content "$release/BUILD_COMMIT.txt"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
-          path: release-output/OpenXR-Toolkit-PSVR2-v1.0-x64/
+          name: ${{ github.ref_name == 'release/v1.1-rc' && 'OpenXR-Toolkit-PSVR2-v1.1-RC-x64' || github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
+          path: release-output/OpenXR-Toolkit-PSVR2-*/
           if-no-files-found: error
