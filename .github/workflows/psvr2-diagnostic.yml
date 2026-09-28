@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - diag/psvr2-eye-actions
+      - fix/opencomposite-eye-actions
 
 jobs:
   build:
