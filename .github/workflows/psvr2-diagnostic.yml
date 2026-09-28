@@ -10,6 +10,7 @@ on:
       - feature/crop-resolution-to-fov-v2
       - release/psvr2-toolkit-rc1
       - release/v1.0
+      - fix/native-openxr-app-owned-eye-extension
 
 jobs:
   build:
@@ -96,6 +97,6 @@ jobs:
           git rev-parse HEAD | Set-Content "$release/BUILD_COMMIT.txt"
       - uses: actions/upload-artifact@v4
         with:
-          name: OpenXR-Toolkit-PSVR2-v1.0-x64
+          name: ${{ github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
           path: release-output/OpenXR-Toolkit-PSVR2-v1.0-x64/
           if-no-files-found: error

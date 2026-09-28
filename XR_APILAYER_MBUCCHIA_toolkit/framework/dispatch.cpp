@@ -104,6 +104,14 @@ namespace LAYER_NAMESPACE {
         // xrEnumerateInstanceExtensionProperties() without an XrInstance. However, some API layers (eg: Ultraleap) do
         // not seem to properly handle this case. So we create a dummy instance.
         std::set<std::string> extensionsToRequest;
+        bool eyeGazeAvailable = false;
+        bool extensionsEnumerated = false;
+        bool eyeGazeAppRequested = false;
+        for (uint32_t i = 0; i < instanceCreateInfo->enabledExtensionCount; ++i) {
+            if (std::string_view(instanceCreateInfo->enabledExtensionNames[i]) == "XR_EXT_eye_gaze_interaction") {
+                eyeGazeAppRequested = true;
+            }
+        }
         if (!fastInitialization) {
             XrInstance dummyInstance = XR_NULL_HANDLE;
             PFN_xrEnumerateInstanceExtensionProperties xrEnumerateInstanceExtensionProperties = nullptr;
@@ -179,7 +187,7 @@ namespace LAYER_NAMESPACE {
                 std::vector<XrExtensionProperties> extensions(extensionsCount, {XR_TYPE_EXTENSION_PROPERTIES});
                 CHECK_XRCMD(xrEnumerateInstanceExtensionProperties(
                     nullptr, extensionsCount, &extensionsCount, extensions.data()));
-                bool eyeGazeAvailable = false;
+                extensionsEnumerated = true;
                 for (auto extension : extensions) {
                     const std::string extensionName(extension.extensionName);
 
@@ -227,6 +235,12 @@ namespace LAYER_NAMESPACE {
             }
         }
 
+        // Keep the application's extension list intact and only append extensions it did not already enable.
+        for (uint32_t i = 0; i < instanceCreateInfo->enabledExtensionCount; ++i) {
+            extensionsToRequest.erase(instanceCreateInfo->enabledExtensionNames[i]);
+        }
+        const bool eyeGazeToolkitRequested = extensionsToRequest.count("XR_EXT_eye_gaze_interaction") != 0;
+
         // Add the extra extensions to the list of requested extensions when available.
         XrInstanceCreateInfo chainInstanceCreateInfo = *instanceCreateInfo;
         std::vector<const char*> newEnabledExtensionNames;
@@ -247,6 +261,10 @@ namespace LAYER_NAMESPACE {
                 }
             }
         }
+
+        DiagnosticLog("eye extension runtime_available=%s app_requested=%u toolkit_requested=%u final_enabled_count=%u",
+                      extensionsEnumerated ? (eyeGazeAvailable ? "1" : "0") : "unknown",
+                      eyeGazeAppRequested, eyeGazeToolkitRequested, chainInstanceCreateInfo.enabledExtensionCount);
 
         for (uint32_t i = 0; i < chainInstanceCreateInfo.enabledExtensionCount; i++) {
             if (std::string_view(chainInstanceCreateInfo.enabledExtensionNames[i]) == "XR_EXT_eye_gaze_interaction") {

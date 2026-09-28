@@ -51,6 +51,8 @@ namespace {
 
         void beginSession(XrSession session) override {
             m_session = session;
+            m_firstProjectedGazeLogged = false;
+            m_changedProjectedGazeLogged = false;
 
             // Create a reference space.
             {
@@ -151,6 +153,24 @@ namespace {
                     m_eyeGazeState.leftPoint.y = m_gaze[0].y;
                     m_eyeGazeState.rightPoint.x = m_gaze[1].x;
                     m_eyeGazeState.rightPoint.y = m_gaze[1].y;
+
+                    if (m_eyeTrackerActionSet != XR_NULL_HANDLE) {
+                        if (!m_firstProjectedGazeLogged) {
+                            m_firstProjectedGazeLogged = true;
+                            m_initialProjectedGaze[0] = m_gaze[0];
+                            m_initialProjectedGaze[1] = m_gaze[1];
+                            DiagnosticLog("eye projectedGaze first left=(%.4f,%.4f) right=(%.4f,%.4f)",
+                                          m_gaze[0].x, m_gaze[0].y, m_gaze[1].x, m_gaze[1].y);
+                        } else if (!m_changedProjectedGazeLogged &&
+                                   (std::fabs(m_gaze[0].x - m_initialProjectedGaze[0].x) > 0.02f ||
+                                    std::fabs(m_gaze[0].y - m_initialProjectedGaze[0].y) > 0.02f ||
+                                    std::fabs(m_gaze[1].x - m_initialProjectedGaze[1].x) > 0.02f ||
+                                    std::fabs(m_gaze[1].y - m_initialProjectedGaze[1].y) > 0.02f)) {
+                            m_changedProjectedGazeLogged = true;
+                            DiagnosticLog("eye projectedGaze first_change left=(%.4f,%.4f) right=(%.4f,%.4f)",
+                                          m_gaze[0].x, m_gaze[0].y, m_gaze[1].x, m_gaze[1].y);
+                        }
+                    }
                 }
             }
 
@@ -181,6 +201,9 @@ namespace {
         mutable XrVector2f m_gaze[ViewCount];
         mutable bool m_valid{false};
         mutable EyeGazeState m_eyeGazeState{};
+        mutable bool m_firstProjectedGazeLogged{false};
+        mutable bool m_changedProjectedGazeLogged{false};
+        mutable XrVector2f m_initialProjectedGaze[ViewCount]{};
     };
 
     class OpenXrEyeTracker : public EyeTrackerBase {
@@ -196,6 +219,7 @@ namespace {
             EyeTrackerBase::beginSession(session);
             m_gazeQueries = 0;
             m_lastGazeActive = false;
+            m_firstActiveLogged = false;
             m_lastPoseError = XR_SUCCESS;
             m_lastLocateError = XR_SUCCESS;
             m_locateValidLogged = false;
@@ -305,6 +329,11 @@ namespace {
                 }
                 m_lastPoseError = result;
                 CHECK_XRCMD(result);
+                if (actionStatePose.isActive && !m_firstActiveLogged) {
+                    m_firstActiveLogged = true;
+                    DiagnosticLog("eye gaze_active first query=%llu session=%p action=%p",
+                                  static_cast<unsigned long long>(query), m_session, m_eyeGazeAction);
+                }
                 m_lastGazeActive = !!actionStatePose.isActive;
 
                 if (!actionStatePose.isActive) {
@@ -357,6 +386,7 @@ namespace {
         XrSpace m_eyeSpace{XR_NULL_HANDLE};
         mutable uint64_t m_gazeQueries{0};
         mutable bool m_lastGazeActive{false};
+        mutable bool m_firstActiveLogged{false};
         mutable XrResult m_lastPoseError{XR_SUCCESS};
         mutable XrResult m_lastLocateError{XR_SUCCESS};
         mutable bool m_locateValidLogged{false};

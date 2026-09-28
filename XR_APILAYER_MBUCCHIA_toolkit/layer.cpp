@@ -474,19 +474,27 @@ namespace {
             // ...otherwise, we will try to fallback to OpenXR.
 
             // TODO: If Foveated Rendering is disabled, maybe do not initialize the eye tracker?
-            if (m_configManager->getValue(config::SettingEyeTrackingEnabled)) {
+            const bool eyeTrackingConfigured = m_configManager->getValue(config::SettingEyeTrackingEnabled) != 0;
+            const char* eyeTrackerProvider = "none";
+            if (eyeTrackingConfigured) {
                 if (omniceptClient) {
                     m_eyeTracker = input::CreateOmniceptEyeTracker(*this, m_configManager, std::move(omniceptClient));
+                    eyeTrackerProvider = "omnicept";
                 } else if (m_hasPimaxEyeTracker) {
                     m_eyeTracker = input::CreatePimaxEyeTracker(*this, m_configManager);
+                    eyeTrackerProvider = "pimax";
                 } else if (hasEyeTrackerFB) {
                     m_eyeTracker = input::CreateEyeTrackerFB(*this, m_configManager);
+                    eyeTrackerProvider = "openxr_fb";
                 } else {
                     m_eyeTracker = input::CreateEyeTracker(*this, m_configManager);
+                    eyeTrackerProvider = "openxr_ext";
 
                     m_needVarjoPollEventWorkaround = m_runtimeName.find("Varjo") != std::string::npos;
                 }
             }
+            DiagnosticLog("eye tracker object created=%u provider=%s setting_enabled=%u",
+                          !!m_eyeTracker, eyeTrackerProvider, eyeTrackingConfigured);
 
             // Clear HAM-related events so they don't fire off unnecessarily.
             (void)m_configManager->getValue(config::SettingDisableHAM);
@@ -664,6 +672,17 @@ namespace {
                 if (!m_supportEyeTracking) {
                     m_eyeTracker.reset();
                 }
+                const bool providerOpenXr = m_eyeTracker && !m_isOmniceptDetected && !m_hasPimaxEyeTracker;
+                const bool eyeTrackingConfigured = m_configManager->getValue(config::SettingEyeTrackingEnabled) != 0;
+                const char* providerReason = providerOpenXr ? "eligible"
+                                             : !eyeTrackingConfigured ? "eye_tracking_setting_off"
+                                             : !m_supportEyeTracking ? "system_unsupported_or_runtime_filtered"
+                                             : m_isOmniceptDetected ? "omnicept_preferred"
+                                             : m_hasPimaxEyeTracker ? "pimax_preferred"
+                                             : "tracker_not_created";
+                DiagnosticLog("eye provider eligibility setting_enabled=%u system_support=%u eye_support=%u provider_openxr=%u tracker_created=%u reason=%s",
+                              eyeTrackingConfigured, eyeTrackingSystemProperties.supportsEyeGazeInteraction,
+                              m_supportEyeTracking, providerOpenXr, !!m_eyeTracker, providerReason);
 
                 // Apply override to the target resolution.
                 if (m_configManager->getValue(config::SettingResolutionOverride)) {
@@ -2287,6 +2306,8 @@ namespace {
                 if (m_isOpenComposite) {
                     m_eyeTracker->setActionSetReady(true);
                 }
+                DiagnosticLog("eye first_sync session=%p result=%s set=%p",
+                              session, xr::ToCString(result), m_eyeTracker->getActionSet());
                 DiagnosticLog("eye_set_ready session=%p attached=%u sync_seen=1", session, m_isActionSetAttached);
             }
             if (XR_SUCCEEDED(result) && m_handTracker && isVrSession(session)) {
