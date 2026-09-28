@@ -7,6 +7,7 @@ on:
       - diag/psvr2-eye-actions
       - fix/opencomposite-eye-actions
       - feature/crop-resolution-to-fov-v1
+      - feature/crop-resolution-to-fov-v2
 
 jobs:
   build:

@@ -41,6 +41,92 @@ namespace {
     // 2 frames.
     constexpr uint32_t GpuTimerLatency = 2;
 
+    // Keep this transformation identical to the simple-FOV path in xrLocateViews().
+    XrFovf ScaleSimpleFov(XrFovf fov, int percent) {
+        if (percent != 100) {
+            StoreXrFov(&fov, LoadXrFov(fov) * DirectX::XMVectorReplicate(percent * 0.01f));
+        }
+        return fov;
+    }
+
+    bool GetFovRatios(const XrFovf& original, const XrFovf& modified, float& width, float& height) {
+        constexpr float Limit = 1.57079632679f - 0.001f;
+        const float angles[] = {original.angleLeft, original.angleRight, original.angleUp, original.angleDown,
+                                modified.angleLeft, modified.angleRight, modified.angleUp, modified.angleDown};
+        for (const float angle : angles) {
+            if (!std::isfinite(angle) || std::abs(angle) >= Limit) {
+                return false;
+            }
+        }
+        if (original.angleLeft >= original.angleRight || original.angleDown >= original.angleUp ||
+            modified.angleLeft >= modified.angleRight || modified.angleDown >= modified.angleUp) {
+            return false;
+        }
+        const float originalWidth = std::tan(original.angleRight) - std::tan(original.angleLeft);
+        const float originalHeight = std::tan(original.angleUp) - std::tan(original.angleDown);
+        width = (std::tan(modified.angleRight) - std::tan(modified.angleLeft)) / originalWidth;
+        height = (std::tan(modified.angleUp) - std::tan(modified.angleDown)) / originalHeight;
+        return std::isfinite(width) && std::isfinite(height) && width > 0.f && height > 0.f &&
+               width <= 1.0001f && height <= 1.0001f;
+    }
+
+    uint32_t CropRecommendedSize(uint32_t raw, float ratio) {
+        return std::min(raw, roundUp(std::max(2u, static_cast<uint32_t>(std::lround(raw * ratio))), 2u));
+    }
+
+    std::filesystem::path GetFovCalibrationPath(const std::string& identity) {
+        uint64_t hash = 14695981039346656037ull;
+        for (const unsigned char byte : identity) {
+            hash = (hash ^ byte) * 1099511628211ull;
+        }
+        return localAppData / "configs" / fmt::format("fov_crop_calibration_{:016x}.txt", hash);
+    }
+
+    bool ReadFovCalibration(const std::filesystem::path& path,
+                            const std::string& identity,
+                            XrFovf (&fov)[utilities::ViewCount]) {
+        std::ifstream input(path);
+        std::string version;
+        std::string storedIdentity;
+        if (!std::getline(input, version) || version != "FOV_CROP_V2" ||
+            !(input >> std::quoted(storedIdentity)) || storedIdentity != identity) {
+            return false;
+        }
+        for (auto& eye : fov) {
+            if (!(input >> eye.angleLeft >> eye.angleRight >> eye.angleUp >> eye.angleDown)) {
+                return false;
+            }
+            float width = 0.f, height = 0.f;
+            if (!GetFovRatios(eye, eye, width, height)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool WriteFovCalibration(const std::filesystem::path& path,
+                             const std::string& identity,
+                             const XrFovf (&fov)[utilities::ViewCount]) {
+        auto temporary = path;
+        temporary += fmt::format(".{}.tmp", GetCurrentProcessId());
+        {
+            std::ofstream output(temporary, std::ios::trunc);
+            if (!output) {
+                return false;
+            }
+            output << "FOV_CROP_V2\n" << std::quoted(identity) << '\n' << std::setprecision(9);
+            for (const auto& eye : fov) {
+                output << eye.angleLeft << ' ' << eye.angleRight << ' ' << eye.angleUp << ' ' << eye.angleDown << '\n';
+            }
+            output.flush();
+            if (!output) {
+                return false;
+            }
+        }
+        return MoveFileExW(temporary.c_str(), path.c_str(),
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    }
+
     struct SwapchainImages {
         std::shared_ptr<graphics::ITexture> appTexture;
         std::shared_ptr<graphics::ITexture> runtimeTexture;
@@ -443,10 +529,16 @@ namespace {
                                                                          views));
 
                 m_cropActive = false;
+                m_cropExact = false;
+                m_cropCacheHit = false;
+                m_cropCalibrationIdentity.clear();
+                m_cropCalibrationPath.clear();
                 m_cropEnumerationLogged = false;
                 for (uint32_t eye = 0; eye < std::min(viewCount, utilities::ViewCount); eye++) {
                     m_runtimeRecommendedWidth[eye] = views[eye].recommendedImageRectWidth;
                     m_runtimeRecommendedHeight[eye] = views[eye].recommendedImageRectHeight;
+                    m_cropRecommendedWidth[eye] = m_runtimeRecommendedWidth[eye];
+                    m_cropRecommendedHeight[eye] = m_runtimeRecommendedHeight[eye];
                     Log("[FOV-CROP] runtime eye=%u recommended=%ux%u max=%ux%u\n",
                         eye, views[eye].recommendedImageRectWidth, views[eye].recommendedImageRectHeight,
                         views[eye].maxImageRectWidth, views[eye].maxImageRectHeight);
@@ -577,6 +669,26 @@ namespace {
 
                 m_cropFovPercent = m_configManager->peekValue(config::SettingFOV);
                 const bool cropRequested = m_configManager->peekValue(config::SettingCropResolutionToFOV);
+                if (cropRequested && viewCount == utilities::ViewCount) {
+                    m_cropCalibrationIdentity = fmt::format(
+                        "runtime={}|system={}|vendor={}|viewConfig={}|viewCount={}|eye0={}x{}|eye1={}x{}",
+                        m_runtimeName, m_systemName, systemProperties.vendorId,
+                        static_cast<int>(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO), viewCount,
+                        m_runtimeRecommendedWidth[0], m_runtimeRecommendedHeight[0],
+                        m_runtimeRecommendedWidth[1], m_runtimeRecommendedHeight[1]);
+                    m_cropCalibrationPath = GetFovCalibrationPath(m_cropCalibrationIdentity);
+                    m_cropCacheHit = ReadFovCalibration(m_cropCalibrationPath, m_cropCalibrationIdentity,
+                                                        m_cropOriginalFov);
+                    Log("[FOV-CROP] calibration cache %s key=\"%s\" file=\"%s\"\n",
+                        m_cropCacheHit ? "hit" : "miss", m_cropCalibrationIdentity.c_str(),
+                        m_cropCalibrationPath.string().c_str());
+                    if (m_cropCacheHit) {
+                        for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                            Log("[FOV-CROP] calibration loaded eye=%u original=%s\n", eye,
+                                xr::ToString(m_cropOriginalFov[eye]).c_str());
+                        }
+                    }
+                }
                 const char* cropReason = "active";
                 if (!cropRequested) {
                     cropReason = "off";
@@ -595,14 +707,61 @@ namespace {
                     cropReason = "fov_not_reduced";
                 } else {
                     m_cropActive = true;
+                    m_cropExact = m_cropCacheHit;
+                    float exactWidth[utilities::ViewCount]{};
+                    float exactHeight[utilities::ViewCount]{};
+                    if (m_cropExact) {
+                        for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                            const XrFovf modified = ScaleSimpleFov(m_cropOriginalFov[eye], m_cropFovPercent);
+                            if (!GetFovRatios(m_cropOriginalFov[eye], modified,
+                                              exactWidth[eye], exactHeight[eye])) {
+                                m_cropExact = false;
+                                m_cropCacheHit = false;
+                                Log("[FOV-CROP] invalid calibration ratio eye=%u; using linear fallback\n", eye);
+                                break;
+                            }
+                        }
+                    }
                     m_displayWidth = m_displayHeight = 0;
                     for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
-                        const auto [cropWidth, cropHeight] =
-                            config::GetScaledDimensions(m_cropFovPercent, -1, m_runtimeRecommendedWidth[eye],
-                                                        m_runtimeRecommendedHeight[eye], 2);
-                        m_displayWidth = std::max(m_displayWidth, cropWidth);
-                        m_displayHeight = std::max(m_displayHeight, cropHeight);
+                        if (m_cropExact) {
+                            m_cropRecommendedWidth[eye] =
+                                CropRecommendedSize(m_runtimeRecommendedWidth[eye], exactWidth[eye]);
+                            m_cropRecommendedHeight[eye] =
+                                CropRecommendedSize(m_runtimeRecommendedHeight[eye], exactHeight[eye]);
+                        } else {
+                            std::tie(m_cropRecommendedWidth[eye], m_cropRecommendedHeight[eye]) =
+                                config::GetScaledDimensions(m_cropFovPercent, -1,
+                                                            m_runtimeRecommendedWidth[eye],
+                                                            m_runtimeRecommendedHeight[eye], 2);
+                            m_cropRecommendedWidth[eye] =
+                                std::min(m_cropRecommendedWidth[eye], m_runtimeRecommendedWidth[eye]);
+                            m_cropRecommendedHeight[eye] =
+                                std::min(m_cropRecommendedHeight[eye], m_runtimeRecommendedHeight[eye]);
+                        }
+                        m_displayWidth = std::max(m_displayWidth, m_cropRecommendedWidth[eye]);
+                        m_displayHeight = std::max(m_displayHeight, m_cropRecommendedHeight[eye]);
+                        const float widthRatio = static_cast<float>(m_cropRecommendedWidth[eye]) /
+                                                 m_runtimeRecommendedWidth[eye];
+                        const float heightRatio = static_cast<float>(m_cropRecommendedHeight[eye]) /
+                                                  m_runtimeRecommendedHeight[eye];
+                        Log("[FOV-CROP] crop mode=%s eye=%u raw=%ux%u calculated=%ux%u "
+                            "exactWidthRatio=%.6f exactHeightRatio=%.6f appliedWidthRatio=%.6f "
+                            "appliedHeightRatio=%.6f relativePixels=%.6f\n",
+                            m_cropExact ? "exact" : "linear_fallback", eye,
+                            m_runtimeRecommendedWidth[eye], m_runtimeRecommendedHeight[eye],
+                            m_cropRecommendedWidth[eye], m_cropRecommendedHeight[eye],
+                            m_cropExact ? exactWidth[eye] : 0.f,
+                            m_cropExact ? exactHeight[eye] : 0.f,
+                            widthRatio, heightRatio, widthRatio * heightRatio);
                     }
+                    if (!m_cropExact) {
+                        Log("[FOV-CROP] exact crop unavailable - calibration pending; "
+                            "linear fallback for this execution\n");
+                    }
+                    Log("[FOV-CROP] shared texture-array policy: max of both eyes=%ux%u; "
+                        "per-eye recommendations remain available for separate swapchains\n",
+                        m_displayWidth, m_displayHeight);
                 }
                 const float widthRatio = m_cropActive ? static_cast<float>(m_displayWidth) /
                                                            m_runtimeRecommendedWidth[0]
@@ -611,12 +770,13 @@ namespace {
                                                             m_runtimeRecommendedHeight[0]
                                                        : 1.f;
                 Log("[FOV-CROP] app=%s opencomposite=%u requested=%u active=%u reason=%s fov_type=%d "
-                    "scaling_type=%d resolution_override=%u fov_percent=%d delivered=%ux%u "
+                    "scaling_type=%d resolution_override=%u fov_percent=%d mode=%s sharedMax=%ux%u "
                     "widthRatio=%.4f heightRatio=%.4f relativePixels=%.4f\n",
                     m_applicationName.c_str(), m_isOpenComposite, cropRequested, m_cropActive, cropReason,
                     m_configManager->peekValue(config::SettingFOVType),
                     static_cast<int>(m_configManager->peekEnumValue<config::ScalingType>(config::SettingScalingType)),
                     m_configManager->peekValue(config::SettingResolutionOverride), m_cropFovPercent,
+                    m_cropActive ? (m_cropExact ? "exact" : "linear_fallback") : "inactive",
                     m_displayWidth, m_displayHeight, widthRatio, heightRatio,
                     widthRatio * heightRatio);
 
@@ -686,16 +846,19 @@ namespace {
 
                 // Override the recommended image size to account for scaling.
                 for (uint32_t i = 0; i < *viewCountOutput; i++) {
-                    views[i].recommendedImageRectWidth = inputWidth;
-                    views[i].recommendedImageRectHeight = inputHeight;
+                    views[i].recommendedImageRectWidth = m_cropActive && i < utilities::ViewCount
+                                                             ? m_cropRecommendedWidth[i] : inputWidth;
+                    views[i].recommendedImageRectHeight = m_cropActive && i < utilities::ViewCount
+                                                              ? m_cropRecommendedHeight[i] : inputHeight;
                 }
                 if (!m_cropEnumerationLogged) {
                     for (uint32_t eye = 0; eye < std::min(*viewCountOutput, utilities::ViewCount); eye++) {
                         Log("[FOV-CROP] xrEnumerateViewConfigurationViews eye=%u raw=%ux%u delivered=%ux%u "
-                            "active=%u fov_percent=%d\n",
+                            "active=%u mode=%s fov_percent=%d sharedMax=%ux%u\n",
                             eye, m_runtimeRecommendedWidth[eye], m_runtimeRecommendedHeight[eye],
                             views[eye].recommendedImageRectWidth, views[eye].recommendedImageRectHeight,
-                            m_cropActive, m_cropFovPercent);
+                            m_cropActive, m_cropActive ? (m_cropExact ? "exact" : "linear_fallback") : "inactive",
+                            m_cropFovPercent, m_displayWidth, m_displayHeight);
                     }
                     m_cropEnumerationLogged = true;
                 }
@@ -981,6 +1144,8 @@ namespace {
                     m_diagnosticSyncCalls = 0;
                     m_diagnosticFrames = 0;
                     m_cropFovLogged = false;
+                    m_cropCalibrationChecked = false;
+                    m_cropInvalidFovLogged = false;
 
                     // Remember the XrSession to use.
                     m_vrSession = *session;
@@ -1846,6 +2011,45 @@ namespace {
                 using namespace DirectX;
 
                 const XrFovf originalFov[utilities::ViewCount] = {views[0].fov, views[1].fov};
+                if (!m_cropCalibrationIdentity.empty() && !m_cropCalibrationChecked) {
+                    float ratioWidth = 0.f, ratioHeight = 0.f;
+                    if (GetFovRatios(originalFov[0], originalFov[0], ratioWidth, ratioHeight) &&
+                        GetFovRatios(originalFov[1], originalFov[1], ratioWidth, ratioHeight)) {
+                        m_cropCalibrationChecked = true;
+                        for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                            Log("[FOV-CROP] calibration observed eye=%u original=%s\n", eye,
+                                xr::ToString(originalFov[eye]).c_str());
+                        }
+                        bool changed = !m_cropCacheHit;
+                        if (m_cropCacheHit) {
+                            for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                                const float observed[] = {originalFov[eye].angleLeft, originalFov[eye].angleRight,
+                                                          originalFov[eye].angleUp, originalFov[eye].angleDown};
+                                const float cached[] = {m_cropOriginalFov[eye].angleLeft,
+                                                        m_cropOriginalFov[eye].angleRight,
+                                                        m_cropOriginalFov[eye].angleUp,
+                                                        m_cropOriginalFov[eye].angleDown};
+                                for (uint32_t angle = 0; angle < 4; angle++) {
+                                    changed |= std::abs(observed[angle] - cached[angle]) > 0.001f;
+                                }
+                            }
+                        }
+                        if (changed) {
+                            if (WriteFovCalibration(m_cropCalibrationPath, m_cropCalibrationIdentity, originalFov)) {
+                                Log("[FOV-CROP] calibration stored - restart for exact crop; "
+                                    "key=\"%s\"\n", m_cropCalibrationIdentity.c_str());
+                            } else {
+                                Log("[FOV-CROP] calibration write failed file=\"%s\"\n",
+                                    m_cropCalibrationPath.string().c_str());
+                            }
+                        } else {
+                            Log("[FOV-CROP] calibration cache verified against xrLocateViews\n");
+                        }
+                    } else if (!m_cropInvalidFovLogged) {
+                        Log("[FOV-CROP] invalid original FOV in xrLocateViews; waiting for valid views\n");
+                        m_cropInvalidFovLogged = true;
+                    }
+                }
 
                 m_posesForFrame[0].pose = views[0].pose;
                 m_posesForFrame[1].pose = views[1].pose;
@@ -1927,10 +2131,8 @@ namespace {
                 if ((m_cropActive ? 0 : m_configManager->getValue(config::SettingFOVType)) == 0) {
                     const auto fovOverride = m_cropActive ? m_cropFovPercent :
                                                            m_configManager->getValue(config::SettingFOV);
-                    if (fovOverride != 100) {
-                        StoreXrFov(&views[0].fov, LoadXrFov(views[0].fov) * XMVectorReplicate(fovOverride * 0.01f));
-                        StoreXrFov(&views[1].fov, LoadXrFov(views[1].fov) * XMVectorReplicate(fovOverride * 0.01f));
-                    }
+                    views[0].fov = ScaleSimpleFov(views[0].fov, fovOverride);
+                    views[1].fov = ScaleSimpleFov(views[1].fov, fovOverride);
                 } else {
                     // XrFovF layout is: L,R,U,D
                     const auto fov1 = XMINT4(m_configManager->getValue(config::SettingFOVLeftLeft),
@@ -1957,30 +2159,23 @@ namespace {
                     for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
                         const auto& raw = originalFov[eye];
                         const auto& modified = views[eye].fov;
-                        const float rawWidthSpan = std::tan(raw.angleRight) - std::tan(raw.angleLeft);
-                        const float rawHeightSpan = std::tan(raw.angleUp) - std::tan(raw.angleDown);
-                        const float exactWidthRatio = std::abs(rawWidthSpan) > 0.000001f
-                                                          ? std::abs((std::tan(modified.angleRight) -
-                                                                      std::tan(modified.angleLeft)) / rawWidthSpan)
-                                                          : 0.f;
-                        const float exactHeightRatio = std::abs(rawHeightSpan) > 0.000001f
-                                                           ? std::abs((std::tan(modified.angleUp) -
-                                                                       std::tan(modified.angleDown)) / rawHeightSpan)
-                                                           : 0.f;
+                        float exactWidthRatio = 0.f, exactHeightRatio = 0.f;
+                        const bool validRatios = GetFovRatios(raw, modified, exactWidthRatio, exactHeightRatio);
                         const float appliedWidthRatio = m_cropActive
-                                                            ? static_cast<float>(m_displayWidth) /
+                                                            ? static_cast<float>(m_cropRecommendedWidth[eye]) /
                                                                   m_runtimeRecommendedWidth[eye]
                                                             : 1.f;
                         const float appliedHeightRatio = m_cropActive
-                                                             ? static_cast<float>(m_displayHeight) /
+                                                             ? static_cast<float>(m_cropRecommendedHeight[eye]) /
                                                                    m_runtimeRecommendedHeight[eye]
                                                              : 1.f;
                         Log("[FOV-CROP] xrLocateViews session=%p eye=%u original=%s modified=%s "
-                            "exactWidthRatio=%.4f exactHeightRatio=%.4f v1WidthRatio=%.4f v1HeightRatio=%.4f "
-                            "linearApprox=%.4f\n",
+                            "validRatios=%u exactWidthRatio=%.6f exactHeightRatio=%.6f "
+                            "appliedWidthRatio=%.6f appliedHeightRatio=%.6f linearApprox=%.4f mode=%s\n",
                             session, eye, xr::ToString(raw).c_str(), xr::ToString(modified).c_str(),
-                            exactWidthRatio, exactHeightRatio, appliedWidthRatio, appliedHeightRatio,
-                            m_cropActive ? m_cropFovPercent * 0.01f : 1.f);
+                            validRatios, exactWidthRatio, exactHeightRatio, appliedWidthRatio, appliedHeightRatio,
+                            m_cropActive ? m_cropFovPercent * 0.01f : 1.f,
+                            m_cropActive ? (m_cropExact ? "exact" : "linear_fallback") : "inactive");
                     }
                     m_cropFovLogged = true;
                 }
@@ -2889,30 +3084,47 @@ namespace {
                         auto& swapchainState = swapchainIt->second;
                         auto& swapchainImages = swapchainState.images[swapchainState.acquiredImageIndex];
                         if (m_cropActive && !swapchainState.cropRecommendationLogged[eye]) {
-                            const uint32_t expectedWidth = m_displayWidth * (useDoubleWide ? 2 : 1);
-                            const uint32_t originalWidth = m_runtimeRecommendedWidth[eye] *
-                                                           (useDoubleWide ? 2 : 1);
-                            const bool targetRect = view.subImage.imageRect.extent.width == m_displayWidth &&
-                                                    view.subImage.imageRect.extent.height == m_displayHeight;
+                            const uint32_t expectedWidth = useDoubleWide
+                                                               ? m_cropRecommendedWidth[0] + m_cropRecommendedWidth[1]
+                                                               : useTextureArrays ? m_displayWidth
+                                                                                  : m_cropRecommendedWidth[eye];
+                            const uint32_t expectedHeight = useDoubleWide || useTextureArrays
+                                                                ? m_displayHeight : m_cropRecommendedHeight[eye];
+                            const uint32_t originalWidth = useDoubleWide
+                                                               ? m_runtimeRecommendedWidth[0] +
+                                                                     m_runtimeRecommendedWidth[1]
+                                                               : m_runtimeRecommendedWidth[eye];
+                            const bool targetRect =
+                                (view.subImage.imageRect.extent.width == m_cropRecommendedWidth[eye] &&
+                                 view.subImage.imageRect.extent.height == m_cropRecommendedHeight[eye]) ||
+                                (useTextureArrays && view.subImage.imageRect.extent.width == m_displayWidth &&
+                                 view.subImage.imageRect.extent.height == m_displayHeight);
                             const bool originalRect =
                                 view.subImage.imageRect.extent.width == m_runtimeRecommendedWidth[eye] &&
                                 view.subImage.imageRect.extent.height == m_runtimeRecommendedHeight[eye];
-                            const bool targetTexture = swapchainState.requestedWidth == expectedWidth &&
-                                                       swapchainState.requestedHeight == m_displayHeight;
+                            const bool targetTexture =
+                                (swapchainState.requestedWidth == expectedWidth ||
+                                 (useDoubleWide && swapchainState.requestedWidth == m_displayWidth * 2)) &&
+                                swapchainState.requestedHeight == expectedHeight;
                             const bool originalTexture = swapchainState.requestedWidth == originalWidth &&
                                                          swapchainState.requestedHeight ==
                                                              m_runtimeRecommendedHeight[eye];
                             const char* status = targetRect && targetTexture ? "accepted"
                                                  : originalRect && originalTexture ? "ignored"
                                                                                    : "custom_or_undetermined";
-                            Log("[FOV-CROP] crop recommendation %s session=%p swapchain=%p eye=%u layout=%s "
-                                "arraySize=%u requested=%ux%u imageRect=%s recommended=%ux%u raw=%ux%u\n",
+                            Log("[FOV-CROP] %s crop recommendation %s session=%p swapchain=%p eye=%u layout=%s "
+                                "arraySize=%u requested=%ux%u imageRect=%s recommended=%ux%u "
+                                "sharedMax=%ux%u raw=%ux%u arrayAdequate=%u\n",
+                                m_cropExact ? "exact" : "linear_fallback",
                                 status, session, view.subImage.swapchain, eye,
-                                useTextureArrays ? "texture_array" : useDoubleWide ? "double_wide" : "separate_eye",
+                                useTextureArrays ? "texture_array" : useDoubleWide ? "side_by_side" : "separate_swapchain",
                                 swapchainState.requestedArraySize, swapchainState.requestedWidth,
                                 swapchainState.requestedHeight, xr::ToString(view.subImage.imageRect).c_str(),
-                                m_displayWidth, m_displayHeight, m_runtimeRecommendedWidth[eye],
-                                m_runtimeRecommendedHeight[eye]);
+                                m_cropRecommendedWidth[eye], m_cropRecommendedHeight[eye],
+                                m_displayWidth, m_displayHeight,
+                                m_runtimeRecommendedWidth[eye], m_runtimeRecommendedHeight[eye],
+                                !useTextureArrays || (swapchainState.requestedWidth >= m_displayWidth &&
+                                                      swapchainState.requestedHeight >= m_displayHeight));
                             swapchainState.cropRecommendationLogged[eye] = true;
                         }
 
@@ -3626,8 +3838,17 @@ namespace {
         uint32_t m_displayHeight{0};
         uint32_t m_runtimeRecommendedWidth[utilities::ViewCount]{};
         uint32_t m_runtimeRecommendedHeight[utilities::ViewCount]{};
+        uint32_t m_cropRecommendedWidth[utilities::ViewCount]{};
+        uint32_t m_cropRecommendedHeight[utilities::ViewCount]{};
+        XrFovf m_cropOriginalFov[utilities::ViewCount]{};
+        std::string m_cropCalibrationIdentity;
+        std::filesystem::path m_cropCalibrationPath;
         int m_cropFovPercent{100};
         bool m_cropActive{false};
+        bool m_cropExact{false};
+        bool m_cropCacheHit{false};
+        bool m_cropCalibrationChecked{false};
+        bool m_cropInvalidFovLogged{false};
         bool m_cropEnumerationLogged{false};
         bool m_cropFovLogged{false};
         float m_resolutionHeightRatio{1.f};
