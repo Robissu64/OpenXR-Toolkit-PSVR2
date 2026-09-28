@@ -1,21 +1,19 @@
-# Notas técnicas — PSVR2 Toolkit RC1
+# Notas técnicas finais — OpenXR Toolkit PSVR2 v1.0
 
-## Eye Action lifecycle — resolvido
+## Eye Action lifecycle
 
-A correção `7cde664cf201f586ecac1349d69faed9f9000933` evita o attach artificial antecipado sob OpenComposite. O Eye ActionSet entra na chamada real de `xrAttachSessionActionSets`; o Toolkit só permite consulta de gaze depois de attach e `xrSyncActions` bem-sucedidos. A sessão nativa conserva o fallback para aplicações sem ActionSets. A fase 1 foi validada com ETFR em Gunman Contracts e COMPOUND Demo.
+A correção funcional `7cde664cf201f586ecac1349d69faed9f9000933` evita attach artificial antecipado sob OpenComposite. O Eye ActionSet é acrescentado à chamada real de `xrAttachSessionActionSets`; o Toolkit espera attach e `xrSyncActions` bem-sucedidos antes de consultar gaze. Apps OpenXR nativos sem ActionSets mantêm o fallback artificial. Eye Tracking e ETFR foram validados com Gunman Contracts e COMPOUND Demo.
 
-Na RC1, `[PSVR2-DIAG]` mantém extensão, criação, attach, primeiro sync/readiness, transições de atividade da pose, primeira localização válida, falhas distintas e fim de sessão. Amostras periódicas de frame, sync e projected gaze foram removidas para evitar spam em uso diário.
+Os logs `[PSVR2-DIAG]` permanecem enxutos: extensão, criação, attach, primeiro sync/readiness, transições relevantes, falhas XR e fim de sessão. Não há amostragem periódica de frame, sync ou projected gaze.
 
-## Crop Resolution to FOV — V1 e V2 validados
+## Crop Resolution to FOV
 
-V1 (`463716b8725e3364e893f3ac1823590f5cbf2ab8`) adicionou a opção Off/On e redução linear conservadora da recomendação. V2 (`9d132cd63425831266b589b5cda7e7f4149822a5`) passou a usar as razões exatas por tangentes do FOV original/modificado, compartilhando a transformação de FOV Simple usada em `xrLocateViews`.
+A V1 (`463716b8725e3364e893f3ac1823590f5cbf2ab8`) implementou a recomendação linear. A V2 (`9d132cd63425831266b589b5cda7e7f4149822a5`) usa razões exatas por tangentes do FOV original e modificado de cada olho, com a mesma transformação de FOV Simple usada em `xrLocateViews`.
 
-`xrEnumerateViewConfigurationViews` pode ocorrer antes do primeiro `xrLocateViews`. Por isso, com cache miss, a execução usa fallback linear, captura o FOV original por olho, persiste em `%LOCALAPPDATA%\OpenXR-Toolkit\configs\fov_crop_calibration_*.txt` e pede reinício. O próximo início, com chave compatível, usa Exact. A chave contém runtime, sistema, fabricante, view configuration, número de views e recomendações brutas; percentual de FOV não faz parte da identidade. Cache inválido ou corrompido não é aplicado. O Toolkit não redimensiona swapchains da aplicação.
+Como `xrEnumerateViewConfigurationViews` geralmente precede `xrLocateViews`, um cache miss usa fallback linear durante a primeira execução. O primeiro FOV original válido é salvo em `%LOCALAPPDATA%\OpenXR-Toolkit\configs\fov_crop_calibration_*.txt`. Após reiniciar o jogo, um cache hit compatível ativa Exact. A identidade inclui runtime, headset/system, fabricante, view configuration, número de views e resolução bruta por olho; não inclui percentual de FOV. Arquivo ausente, inválido ou corrompido é ignorado e recalibrado. Alterar runtime/headset/view configuration impede reutilização incompatível.
 
-No Gunman Contracts em PSVR2 com FOV 90%, Exact recomendou e o app aceitou 2756×2872 em vez de 3400×3468: ~67,1% dos pixels originais e ~32,9% de redução estimada. Eye Tracking e ETFR seguiram ativos; nenhum `XR_ERROR` foi observado. A V2 no COMPOUND passou sanity check de abertura, sem medição de crop nesse jogo.
+O Toolkit apenas muda `recommendedImageRectWidth/Height`; não força `xrCreateSwapchain`, `imageRect` ou viewport. Crop Off mantém o fluxo original. Conflitos com FOV Advanced, FSR/NIS/CAS ou resolução manual desativam somente o Crop. `[FOV-CROP]` registra cache, modo, FOV, razões, dimensões e se a recomendação foi aceita ou ignorada quando determinável.
 
-Limitações: FOV Advanced, FSR/NIS/CAS e resolução manual conflitam com Crop; algumas aplicações ignoram a recomendação; arrays/swapchains lado a lado podem escolher dimensões próprias. `[FOV-CROP]` registra modo, razões, dimensões e resultado `accepted`/`ignored`/`custom_or_undetermined` quando inferível. Medir desempenho exige teste em jogo.
+Em Gunman Contracts/PSVR2/SteamVR OpenXR com FOV 90%, a resolução observada mudou de 3400×3468 para 2756×2872, ou ~67,1% dos pixels originais (~32,9% de redução). A RC1 passou o teste final de hardware em Gunman e COMPOUND; não foi medida aceitação de Exact em COMPOUND. Vertigo 2 permaneceu flat via OpenComposite system-wide mesmo sem a layer, e a substituição per-game de `openvr_api.dll` falhou; isso não foi classificado como regressão do Toolkit nem corrigido na v1.0.
 
-## Release candidate
-
-A branch `release/psvr2-toolkit-rc1` parte de V2 `9d132cd63425831266b589b5cda7e7f4149822a5` e limita-se a hardening, logs, status no menu, identificação visível, documentação e artifact de instalação. Consulte `STATUS.md`, `TEST_MATRIX.md` e `docs/PSVR2_RC1_README.md`.
+A v1.0 parte da RC1 `81f0d3cf6361a11ec27ba03d85589d90b08cbea3` e altera somente identificação, documentação e empacotamento. Consulte `STATUS.md`, `TEST_MATRIX.md` e `docs/PSVR2_V1_README.md`.

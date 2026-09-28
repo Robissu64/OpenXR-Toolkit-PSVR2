@@ -1,4 +1,4 @@
-name: PSVR2 eye tracking diagnostic
+name: OpenXR Toolkit PSVR2 build
 
 on:
   workflow_dispatch:
@@ -9,6 +9,7 @@ on:
       - feature/crop-resolution-to-fov-v1
       - feature/crop-resolution-to-fov-v2
       - release/psvr2-toolkit-rc1
+      - release/v1.0
 
 jobs:
   build:
@@ -55,14 +56,14 @@ jobs:
       - name: Restore NuGet packages
         shell: pwsh
         run: nuget restore OpenXR-Toolkit.sln
-      - name: Build unsigned x64 RC1 layer
+      - name: Build unsigned x64 v1.0 layer
         shell: pwsh
         run: msbuild OpenXR-Toolkit.sln /t:XR_APILAYER_MBUCCHIA_toolkit /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v142
-      - name: Stage RC1 release files
+      - name: Stage v1.0 release files
         shell: pwsh
         run: |
           $out = 'bin/x64/Release'
-          $release = 'release-output/OpenXR-Toolkit-PSVR2-RC1-x64'
+          $release = 'release-output/OpenXR-Toolkit-PSVR2-v1.0-x64'
           New-Item -ItemType Directory -Path "$release/shaders" -Force | Out-Null
 
           $runtimeFiles = @(
@@ -87,11 +88,12 @@ jobs:
             Copy-Item -LiteralPath $source -Destination "$release/shaders"
           }
 
-          Copy-Item -LiteralPath 'docs/PSVR2_RC1_README.md' -Destination "$release/README.md"
+          Copy-Item -LiteralPath 'docs/PSVR2_V1_README.md' -Destination "$release/README.md"
+          Copy-Item -LiteralPath 'docs/RELEASE_NOTES_v1.0.md' -Destination "$release/RELEASE_NOTES.md"
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
           git rev-parse HEAD | Set-Content "$release/BUILD_COMMIT.txt"
       - uses: actions/upload-artifact@v4
         with:
-          name: OpenXR-Toolkit-PSVR2-RC1-x64
-          path: release-output/OpenXR-Toolkit-PSVR2-RC1-x64/
+          name: OpenXR-Toolkit-PSVR2-v1.0-x64
+          path: release-output/OpenXR-Toolkit-PSVR2-v1.0-x64/
           if-no-files-found: error
