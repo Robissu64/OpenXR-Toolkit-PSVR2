@@ -44,7 +44,8 @@ namespace {
     // Keep this transformation identical to the simple-FOV path in xrLocateViews().
     XrFovf ScaleSimpleFov(XrFovf fov, int percent) {
         if (percent != 100) {
-            StoreXrFov(&fov, LoadXrFov(fov) * DirectX::XMVectorReplicate(percent * 0.01f));
+            StoreXrFov(&fov, DirectX::XMVectorMultiply(LoadXrFov(fov),
+                                                       DirectX::XMVectorReplicate(percent * 0.01f)));
         }
         return fov;
     }
