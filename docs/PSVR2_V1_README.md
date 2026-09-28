@@ -32,7 +32,7 @@ Native OpenXR games can load the installed layer automatically. OpenVR games req
 - **Menu missing:** confirm SteamVR is the active OpenXR runtime, the installation completed, and the extracted folder has not moved.
 - **Eye tracking or DFR inactive:** confirm eye tracking works in PSVR2Toolkit; then check the Toolkit's Eye tracking and Foveated rendering settings. Look for `[PSVR2-DIAG]` messages.
 - **`Calibration pending` persists:** look for `calibration stored - restart for exact crop`, close the game normally, then relaunch. Calibration files are under `%LOCALAPPDATA%\OpenXR-Toolkit\configs\fov_crop_calibration_*.txt`.
-- **`Inactive`:** check for FSR/NIS/CAS, a manual resolution override, Advanced FOV, or FOV 100%; the reason appears in `[FOV-CROP]`.
+- **`Inactive`:** check for a manual resolution override, Advanced FOV, or FOV 100%; the reason appears in `[FOV-CROP]`.
 - **No pixel reduction:** some games ignore the recommended resolution. Compare `crop recommendation accepted/ignored` with the requested dimensions logged for `xrCreateSwapchain`.
 
 Log file: `%LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log`.

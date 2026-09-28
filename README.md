@@ -80,7 +80,7 @@ The optimized run had **about 55.9% lower average GPU frametime** than baseline;
 
 ## Troubleshooting
 
-If the menu does not appear, check the active OpenXR runtime and that the extracted installation folder has not moved. If DFR is inactive, first confirm eye tracking in PSVR2Toolkit, then check the Toolkit's Eye tracking and Foveated rendering settings. If Crop is `Inactive`, check for incompatible settings such as resolution overrides, FSR/NIS/CAS, Advanced FOV, or FOV 100%. Diagnostic messages are in `%LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log` under `[PSVR2-DIAG]` and `[FOV-CROP]`. See the [installation and troubleshooting guide](docs/PSVR2_V1_README.md).
+If the menu does not appear, check the active OpenXR runtime and that the extracted installation folder has not moved. If DFR is inactive, first confirm eye tracking in PSVR2Toolkit, then check the Toolkit's Eye tracking and Foveated rendering settings. If Crop is `Inactive`, check for incompatible settings such as resolution overrides, Advanced FOV, or FOV 100%. Diagnostic messages are in `%LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log` under `[PSVR2-DIAG]` and `[FOV-CROP]`. See the [installation and troubleshooting guide](docs/PSVR2_V1_README.md).
 
 ## Credits
 

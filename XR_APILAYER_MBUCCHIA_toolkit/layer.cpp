@@ -703,9 +703,6 @@ namespace {
                 } else if (m_runtimeRecommendedWidth[0] < 2 || m_runtimeRecommendedHeight[0] < 2 ||
                            m_runtimeRecommendedWidth[1] < 2 || m_runtimeRecommendedHeight[1] < 2) {
                     cropReason = "invalid_runtime_recommendation";
-                } else if (m_configManager->peekEnumValue<config::ScalingType>(config::SettingScalingType) !=
-                           config::ScalingType::None) {
-                    cropReason = "upscaling_conflict";
                 } else if (m_configManager->peekValue(config::SettingResolutionOverride)) {
                     cropReason = "resolution_override_conflict";
                 } else if (m_configManager->peekValue(config::SettingFOVType) != 0) {
@@ -835,6 +832,7 @@ namespace {
 
                 uint32_t inputWidth = m_displayWidth;
                 uint32_t inputHeight = m_displayHeight;
+                bool upscaling = false;
 
                 switch (upscaleMode) {
                 case config::ScalingType::FSR:
@@ -842,6 +840,7 @@ namespace {
                 case config::ScalingType::CAS: {
                     std::tie(inputWidth, inputHeight) = config::GetScaledDimensions(
                         settingScaling, settingAnamophic, m_displayWidth, m_displayHeight, 2);
+                    upscaling = true;
                 } break;
 
                
@@ -854,11 +853,23 @@ namespace {
                 }
 
                 // Override the recommended image size to account for scaling.
+                // With crop, the upscaler input is the per-eye cropped size reduced by the scaling factor.
                 for (uint32_t i = 0; i < *viewCountOutput; i++) {
-                    views[i].recommendedImageRectWidth = m_cropActive && i < utilities::ViewCount
-                                                             ? m_cropRecommendedWidth[i] : inputWidth;
-                    views[i].recommendedImageRectHeight = m_cropActive && i < utilities::ViewCount
-                                                              ? m_cropRecommendedHeight[i] : inputHeight;
+                    if (m_cropActive && i < utilities::ViewCount) {
+                        views[i].recommendedImageRectWidth = m_cropRecommendedWidth[i];
+                        views[i].recommendedImageRectHeight = m_cropRecommendedHeight[i];
+                        if (upscaling) {
+                            std::tie(views[i].recommendedImageRectWidth, views[i].recommendedImageRectHeight) =
+                                config::GetScaledDimensions(settingScaling,
+                                                            settingAnamophic,
+                                                            m_cropRecommendedWidth[i],
+                                                            m_cropRecommendedHeight[i],
+                                                            2);
+                        }
+                    } else {
+                        views[i].recommendedImageRectWidth = inputWidth;
+                        views[i].recommendedImageRectHeight = inputHeight;
+                    }
                 }
                 if (!m_cropEnumerationLogged) {
                     for (uint32_t eye = 0; eye < std::min(*viewCountOutput, utilities::ViewCount); eye++) {
@@ -3085,27 +3096,40 @@ namespace {
                         auto& swapchainState = swapchainIt->second;
                         auto& swapchainImages = swapchainState.images[swapchainState.acquiredImageIndex];
                         if (m_cropActive && !swapchainState.cropRecommendationLogged[eye]) {
+                            // With upscaling, the application renders the cropped sizes reduced by the scaling factor.
+                            const bool upscaling = m_upscaleMode == config::ScalingType::NIS ||
+                                                   m_upscaleMode == config::ScalingType::FSR ||
+                                                   m_upscaleMode == config::ScalingType::CAS;
+                            const auto appSize = [&](uint32_t width, uint32_t height) {
+                                return upscaling ? config::GetScaledDimensions(
+                                                       m_settingScaling, m_settingAnamorphic, width, height, 2)
+                                                 : std::make_pair(width, height);
+                            };
+                            const auto cropSize0 = appSize(m_cropRecommendedWidth[0], m_cropRecommendedHeight[0]);
+                            const auto cropSize1 = appSize(m_cropRecommendedWidth[1], m_cropRecommendedHeight[1]);
+                            const auto cropSize = eye == 0 ? cropSize0 : cropSize1;
+                            const auto sharedSize = appSize(m_displayWidth, m_displayHeight);
                             const uint32_t expectedWidth = useDoubleWide
-                                                               ? m_cropRecommendedWidth[0] + m_cropRecommendedWidth[1]
-                                                               : useTextureArrays ? m_displayWidth
-                                                                                  : m_cropRecommendedWidth[eye];
+                                                               ? cropSize0.first + cropSize1.first
+                                                               : useTextureArrays ? sharedSize.first
+                                                                                  : cropSize.first;
                             const uint32_t expectedHeight = useDoubleWide || useTextureArrays
-                                                                ? m_displayHeight : m_cropRecommendedHeight[eye];
+                                                                ? sharedSize.second : cropSize.second;
                             const uint32_t originalWidth = useDoubleWide
                                                                ? m_runtimeRecommendedWidth[0] +
                                                                      m_runtimeRecommendedWidth[1]
                                                                : m_runtimeRecommendedWidth[eye];
                             const bool targetRect =
-                                (view.subImage.imageRect.extent.width == m_cropRecommendedWidth[eye] &&
-                                 view.subImage.imageRect.extent.height == m_cropRecommendedHeight[eye]) ||
-                                (useTextureArrays && view.subImage.imageRect.extent.width == m_displayWidth &&
-                                 view.subImage.imageRect.extent.height == m_displayHeight);
+                                (view.subImage.imageRect.extent.width == cropSize.first &&
+                                 view.subImage.imageRect.extent.height == cropSize.second) ||
+                                (useTextureArrays && view.subImage.imageRect.extent.width == sharedSize.first &&
+                                 view.subImage.imageRect.extent.height == sharedSize.second);
                             const bool originalRect =
                                 view.subImage.imageRect.extent.width == m_runtimeRecommendedWidth[eye] &&
                                 view.subImage.imageRect.extent.height == m_runtimeRecommendedHeight[eye];
                             const bool targetTexture =
                                 (swapchainState.requestedWidth == expectedWidth ||
-                                 (useDoubleWide && swapchainState.requestedWidth == m_displayWidth * 2)) &&
+                                 (useDoubleWide && swapchainState.requestedWidth == sharedSize.first * 2)) &&
                                 swapchainState.requestedHeight == expectedHeight;
                             const bool originalTexture = swapchainState.requestedWidth == originalWidth &&
                                                          swapchainState.requestedHeight ==
@@ -3121,11 +3145,11 @@ namespace {
                                 useTextureArrays ? "texture_array" : useDoubleWide ? "side_by_side" : "separate_swapchain",
                                 swapchainState.requestedArraySize, swapchainState.requestedWidth,
                                 swapchainState.requestedHeight, xr::ToString(view.subImage.imageRect).c_str(),
-                                m_cropRecommendedWidth[eye], m_cropRecommendedHeight[eye],
-                                m_displayWidth, m_displayHeight,
+                                cropSize.first, cropSize.second,
+                                sharedSize.first, sharedSize.second,
                                 m_runtimeRecommendedWidth[eye], m_runtimeRecommendedHeight[eye],
-                                !useTextureArrays || (swapchainState.requestedWidth >= m_displayWidth &&
-                                                      swapchainState.requestedHeight >= m_displayHeight));
+                                !useTextureArrays || (swapchainState.requestedWidth >= sharedSize.first &&
+                                                      swapchainState.requestedHeight >= sharedSize.second));
                             swapchainState.cropRecommendationLogged[eye] = true;
                         }
 
