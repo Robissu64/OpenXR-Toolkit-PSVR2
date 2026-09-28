@@ -1157,7 +1157,14 @@ namespace {
                         m_handTracker->beginSession(*session, m_graphicsDevice);
                     }
                     if (m_eyeTracker) {
-                        m_eyeTracker->beginSession(*session);
+                        m_isSuggestingToolkitEyeBinding = true;
+                        try {
+                            m_eyeTracker->beginSession(*session);
+                        } catch (...) {
+                            m_isSuggestingToolkitEyeBinding = false;
+                            throw;
+                        }
+                        m_isSuggestingToolkitEyeBinding = false;
                         m_eyeTracker->setActionSetReady(!m_isOpenComposite);
                     }
                     DiagnosticLog("session created session=%p eye_set=%p opencomposite=%u", *session,
@@ -1272,6 +1279,8 @@ namespace {
                 if (m_eyeTracker) {
                     m_eyeTracker->endSession();
                 }
+                m_toolkitEyeGazeBinding.reset();
+                m_appEyeGazeBindings.clear();
                 if (m_menuSwapchain != XR_NULL_HANDLE) {
                     xrDestroySwapchain(m_menuSwapchain);
                     m_menuSwapchain = XR_NULL_HANDLE;
@@ -1558,10 +1567,16 @@ namespace {
                 return XR_ERROR_VALIDATION_FAILURE;
             }
 
+            const std::string interactionProfile = getPath(suggestedBindings->interactionProfile);
+            const bool isEyeGazeProfile = interactionProfile == "/interaction_profiles/ext/eye_gaze_interaction";
+            const bool isToolkitEyeBinding = isEyeGazeProfile && m_isSuggestingToolkitEyeBinding;
+            const bool actionSetsAttached = m_isActionSetUsed || m_isActionSetAttached;
+            const uint64_t eyeBindingOrder = isEyeGazeProfile ? ++m_eyeBindingSuggestionOrder : 0;
+
             TraceLoggingWrite(g_traceProvider,
                               "xrSuggestInteractionProfileBindings",
                               TLPArg(instance, "Instance"),
-                              TLArg(getPath(suggestedBindings->interactionProfile).c_str(), "InteractionProfile"));
+                              TLArg(interactionProfile.c_str(), "InteractionProfile"));
 
             for (uint32_t i = 0; i < suggestedBindings->countSuggestedBindings; i++) {
                 TraceLoggingWrite(g_traceProvider,
@@ -1570,16 +1585,80 @@ namespace {
                                   TLArg(getPath(suggestedBindings->suggestedBindings[i].binding).c_str(), "Path"));
             }
 
+            XrInteractionProfileSuggestedBinding chainSuggestedBindings = *suggestedBindings;
+            std::vector<XrActionSuggestedBinding> mergedBindings;
+            std::optional<XrActionSuggestedBinding> toolkitBinding = m_toolkitEyeGazeBinding;
+            if (isEyeGazeProfile) {
+                if (isToolkitEyeBinding && suggestedBindings->countSuggestedBindings == 1) {
+                    toolkitBinding = suggestedBindings->suggestedBindings[0];
+                }
+                DiagnosticLog("eye binding suggest order=%llu origin=%s profile=%s input_count=%u toolkit_action_exists=%u attached=%u",
+                              static_cast<unsigned long long>(eyeBindingOrder),
+                              isToolkitEyeBinding ? "toolkit_internal" : "app_forward",
+                              interactionProfile.c_str(), suggestedBindings->countSuggestedBindings,
+                              toolkitBinding.has_value(), actionSetsAttached);
+                for (uint32_t i = 0; i < suggestedBindings->countSuggestedBindings; ++i) {
+                    DiagnosticLog("eye binding input order=%llu index=%u action=%p binding=%s",
+                                  static_cast<unsigned long long>(eyeBindingOrder), i,
+                                  suggestedBindings->suggestedBindings[i].action,
+                                  getPath(suggestedBindings->suggestedBindings[i].binding).c_str());
+                }
+
+                // Repeated suggestions replace the entire profile. Preserve the latest application list on both
+                // sides of the eye tracker's internal suggestion, before any action set is attached.
+                if (!actionSetsAttached && toolkitBinding) {
+                    if (isToolkitEyeBinding) {
+                        mergedBindings = m_appEyeGazeBindings;
+                    } else {
+                        mergedBindings.assign(suggestedBindings->suggestedBindings,
+                                              suggestedBindings->suggestedBindings + suggestedBindings->countSuggestedBindings);
+                    }
+                    const bool alreadyIncluded = std::any_of(
+                        mergedBindings.begin(), mergedBindings.end(), [&](const XrActionSuggestedBinding& binding) {
+                            return binding.action == toolkitBinding->action && binding.binding == toolkitBinding->binding;
+                        });
+                    if (!alreadyIncluded) {
+                        mergedBindings.push_back(*toolkitBinding);
+                    }
+                    chainSuggestedBindings.countSuggestedBindings = static_cast<uint32_t>(mergedBindings.size());
+                    chainSuggestedBindings.suggestedBindings = mergedBindings.data();
+                }
+                DiagnosticLog("eye binding merge order=%llu app_binding_count=%u toolkit_binding_present=%u merged_count=%u attached=%u",
+                              static_cast<unsigned long long>(eyeBindingOrder),
+                              isToolkitEyeBinding ? static_cast<uint32_t>(m_appEyeGazeBindings.size())
+                                                  : suggestedBindings->countSuggestedBindings,
+                              toolkitBinding.has_value(), chainSuggestedBindings.countSuggestedBindings,
+                              actionSetsAttached);
+            }
+
             if (m_configManager->getValue(config::SettingEyeDebugWithController)) {
                 // We must drop calls to allow the controller override for debugging.
                 if (suggestedBindings->countSuggestedBindings > 1 ||
-                    getPath(suggestedBindings->interactionProfile) !=
-                        "/interaction_profiles/hp/mixed_reality_controller") {
+                    interactionProfile != "/interaction_profiles/hp/mixed_reality_controller") {
+                    if (isEyeGazeProfile) {
+                        DiagnosticLog("eye binding result order=%llu origin=%s result=XR_SUCCESS bypassed=1",
+                                      static_cast<unsigned long long>(eyeBindingOrder),
+                                      isToolkitEyeBinding ? "toolkit_internal" : "app_forward");
+                    }
                     return XR_SUCCESS;
                 }
             }
 
-            const XrResult result = OpenXrApi::xrSuggestInteractionProfileBindings(instance, suggestedBindings);
+            const XrResult result = OpenXrApi::xrSuggestInteractionProfileBindings(instance, &chainSuggestedBindings);
+            if (isEyeGazeProfile) {
+                if (XR_SUCCEEDED(result) && !actionSetsAttached) {
+                    if (isToolkitEyeBinding) {
+                        m_toolkitEyeGazeBinding = toolkitBinding;
+                    } else {
+                        m_appEyeGazeBindings.assign(suggestedBindings->suggestedBindings,
+                                                    suggestedBindings->suggestedBindings + suggestedBindings->countSuggestedBindings);
+                    }
+                }
+                DiagnosticLog("eye binding result order=%llu origin=%s result=%s forwarded_count=%u attached=%u",
+                              static_cast<unsigned long long>(eyeBindingOrder),
+                              isToolkitEyeBinding ? "toolkit_internal" : "app_forward", xr::ToCString(result),
+                              chainSuggestedBindings.countSuggestedBindings, actionSetsAttached);
+            }
             if (XR_SUCCEEDED(result) && m_handTracker) {
                 m_handTracker->registerBindings(*suggestedBindings);
             }
@@ -1674,8 +1753,17 @@ namespace {
             TraceLoggingWrite(g_traceProvider, "xrDestroyAction", TLPArg(action, "Action"));
 
             const XrResult result = OpenXrApi::xrDestroyAction(action);
-            if (XR_SUCCEEDED(result) && m_handTracker) {
-                m_handTracker->unregisterAction(action);
+            if (XR_SUCCEEDED(result)) {
+                m_appEyeGazeBindings.erase(
+                    std::remove_if(m_appEyeGazeBindings.begin(), m_appEyeGazeBindings.end(),
+                                   [action](const XrActionSuggestedBinding& binding) { return binding.action == action; }),
+                    m_appEyeGazeBindings.end());
+                if (m_toolkitEyeGazeBinding && m_toolkitEyeGazeBinding->action == action) {
+                    m_toolkitEyeGazeBinding.reset();
+                }
+                if (m_handTracker) {
+                    m_handTracker->unregisterAction(action);
+                }
             }
 
             return result;
@@ -3918,6 +4006,10 @@ namespace {
 
         std::shared_ptr<graphics::IFrameAnalyzer> m_frameAnalyzer;
         std::shared_ptr<input::IEyeTracker> m_eyeTracker;
+        bool m_isSuggestingToolkitEyeBinding{false};
+        uint64_t m_eyeBindingSuggestionOrder{0};
+        std::vector<XrActionSuggestedBinding> m_appEyeGazeBindings;
+        std::optional<XrActionSuggestedBinding> m_toolkitEyeGazeBinding;
         bool m_isActionSetUsed{false};
         bool m_isActionSetAttached{false};
         bool m_isEyeActionSetSynced{false};
