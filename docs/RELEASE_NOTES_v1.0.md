@@ -4,7 +4,7 @@ This independent community fork adds PSVR2 eye tracking through OpenXR, an Eye A
 
 ## Requirements and quick install
 
-Windows x64, PSVR2 with the Sony PSVR2 PC Adapter, SteamVR as the active OpenXR runtime, and [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) with calibrated, working eye tracking. Extract the entire release ZIP to a permanent folder and run `Install-Layer.ps1` as Administrator. Keep that folder in place. Installation is system-wide and only needed once. Run `Uninstall-Layer.ps1` as Administrator to uninstall. See the [installation guide](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/blob/release/v1.0/docs/PSVR2_V1_README.md) or the `README.md` included in the ZIP.
+Windows x64, PSVR2 with the Sony PSVR2 PC Adapter, SteamVR as the active OpenXR runtime, and [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) with calibrated, working eye tracking. Extract the entire release ZIP to a permanent folder, double-click `Install.bat`, accept the Windows UAC prompt, and restart SteamVR. Keep that folder in place. Installation is system-wide and only needed once. Double-click `Uninstall.bat` and accept UAC to uninstall. The PowerShell scripts remain available for manual or advanced installation. See the [installation guide](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/blob/release/v1.0/docs/PSVR2_V1_README.md) or the `README.md` included in the ZIP.
 
 ## Crop calibration
 

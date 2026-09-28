@@ -90,6 +90,8 @@ jobs:
 
           Copy-Item -LiteralPath 'docs/PSVR2_V1_README.md' -Destination "$release/README.md"
           Copy-Item -LiteralPath 'docs/RELEASE_NOTES_v1.0.md' -Destination "$release/RELEASE_NOTES.md"
+          Copy-Item -LiteralPath 'scripts/Install.bat' -Destination $release
+          Copy-Item -LiteralPath 'scripts/Uninstall.bat' -Destination $release
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
           git rev-parse HEAD | Set-Content "$release/BUILD_COMMIT.txt"
       - uses: actions/upload-artifact@v4

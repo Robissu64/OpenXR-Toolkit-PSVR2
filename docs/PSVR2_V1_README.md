@@ -10,11 +10,14 @@ You need Windows x64, a PSVR2 headset with the Sony PSVR2 PC Adapter, SteamVR se
 
 1. Download [`OpenXR-Toolkit-PSVR2-v1.0-x64.zip`](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/download/v1.0/OpenXR-Toolkit-PSVR2-v1.0-x64.zip) from [Releases](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/tag/v1.0).
 2. Extract **all** files to a permanent folder. Do not run the installer from inside the ZIP. Keep the DLLs, JSON manifest, scripts, and `shaders` folder together.
-3. Run `Install-Layer.ps1` as Administrator from that folder. Restart SteamVR and launch a compatible game.
+3. Double-click `Install.bat` in that folder.
+4. Accept the Windows UAC administrator prompt.
+5. Restart SteamVR.
+6. Done. Launch a compatible game.
 
 The installation is system-wide. You do **not** reinstall for each game or reboot. Do **not** move or delete the extracted folder after installation, because the layer registration points to files there.
 
-To uninstall, close VR games and SteamVR, run `Uninstall-Layer.ps1` as Administrator from that same folder, then remove the folder if desired.
+To uninstall, close VR games and SteamVR, double-click `Uninstall.bat` in that same folder, accept the UAC prompt, then remove the folder if desired. For a manual or advanced method, run `Install-Layer.ps1` or `Uninstall-Layer.ps1` as Administrator.
 
 ## Configure the Toolkit
 

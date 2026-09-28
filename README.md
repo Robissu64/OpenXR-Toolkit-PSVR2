@@ -17,14 +17,18 @@ An open-source community fork of [OpenXR Toolkit](https://github.com/mbucchia/Op
 
 ## Installation
 
+If the original OpenXR Toolkit is installed, uninstall it first to avoid registering two layers with the same internal name. Close VR games before installing.
+
 1. Download [`OpenXR-Toolkit-PSVR2-v1.0-x64.zip`](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/download/v1.0/OpenXR-Toolkit-PSVR2-v1.0-x64.zip) from the [v1.0 release](https://github.com/Robissu64/OpenXR-Toolkit-PSVR2/releases/tag/v1.0).
 2. Extract the **entire ZIP** to a permanent folder. Do not run the installer from inside the ZIP; keep the extracted DLL, JSON manifest, scripts, and `shaders` folder together.
-3. If the original OpenXR Toolkit is installed, uninstall it first to avoid registering two layers with the same internal name.
-4. Run `Install-Layer.ps1` from the extracted folder as Administrator. Restart SteamVR and the game.
+3. Double-click `Install.bat` in that folder.
+4. Accept the Windows UAC administrator prompt.
+5. Restart SteamVR.
+6. Done. Launch a compatible game and press **Ctrl+F2** to open the Toolkit menu.
 
 Installation is **system-wide and one-time**. You do not need to reinstall it for each game or after each reboot. **Do not move or delete the extracted folder after installation**: the registered layer points to its files.
 
-To uninstall, close VR games and SteamVR, then run `Uninstall-Layer.ps1` as Administrator from that same folder. You can remove the folder after uninstalling.
+To uninstall, close VR games and SteamVR, **double-click `Uninstall.bat`** in that same folder and accept the UAC prompt. You can remove the folder after uninstalling. For manual or advanced installation, run `Install-Layer.ps1` as Administrator; `Uninstall-Layer.ps1` is the matching manual uninstall method.
 
 ## First run and Toolkit menu
 
