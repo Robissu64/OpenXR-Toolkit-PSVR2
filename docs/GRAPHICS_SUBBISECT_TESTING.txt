@@ -1,0 +1,68 @@
+OpenXR Toolkit PSVR2 - graphics path sub-bisect (diagnostic only)
+=================================================================
+
+Only OpenXR application names Impact and TheMidnightWalk are affected.
+OXRTK_GFX_SUBBISECT is read at process startup. OXRTK_GFX_BISECT is ignored
+for these applications in this build. The default is submode 0.
+
+0  Validated stable Mode 2: direct runtime images, D3D12 wrapper, per-frame
+   nonblocking flush. Immediate downstream release. No copy or Toolkit UI.
+1  Direct runtime images, but downstream release is deferred until xrEndFrame
+   (or the next begin/acquire if a frame is discarded). No copy or Toolkit UI.
+2  Private color image exposed to the game. On app release, CopyResource of all
+   array slices and mips to the matching runtime image, flush on the app queue,
+   and immediately forward release. Depth images stay direct. No processing/UI.
+3  Same private color image and raw copy as 2, but copy, flush and downstream
+   release occur just before runtime xrEndFrame. Pending images are also
+   handled before the next begin/acquire after a discarded frame. No UI.
+4  Existing Mode 3 processing chain, with Toolkit menu and debug overlay
+   rendering suppressed. D3D12 interceptor and Frame Analyzer remain off.
+5  Existing Mode 3 unchanged: processing chain and Toolkit UI. This is the
+   hardware-observed unstable positive control. Interceptor/analyzer off.
+
+Proxy modes preserve the application's swapchain dimensions and original
+XrFrameEndInfo. The private and runtime textures have matching dimensions.
+This diagnostic does not implement a permanent compatibility fix.
+
+Test protocol
+-------------
+Install the included layer. Fully exit the game, SteamVR and Steam (including
+the tray process) between tests. Open PowerShell and run ONE command below.
+If The Midnight Walk offers launch modes, select VR. Keep Safe Mode, Eye
+Tracking, FOV, Crop, and in-game settings identical across all runs.
+Record whether the headset is stable, wobbles, or black, and retain the log.
+Look for [GFX-SUBBISECT] app=... submode=... near session creation and the
+limited downstream_release lines. Do not run multiple modes in one process.
+
+Metro Awakening / Impact (Steam app 2669410)
+--------------------------------------------
+Submode 0:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '0'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Submode 1:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '1'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Submode 2:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '2'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Submode 3:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '3'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Submode 4:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '4'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Submode 5:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '5'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+
+The Midnight Walk (Steam app 2863640)
+--------------------------------------
+Submode 0:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '0'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Submode 1:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '1'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Submode 2:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '2'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Submode 3:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '3'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Submode 4:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '4'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Submode 5:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_SUBBISECT = '5'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+
+Suggested order: 0, 1, 2, 3, 4, 5. Stop after the first unstable submode and
+retain the preceding stable log; the remaining modes are optional controls.

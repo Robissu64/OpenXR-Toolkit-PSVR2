@@ -363,13 +363,15 @@ namespace {
             m_applicationName = createInfo->applicationInfo.applicationName;
             if (isGraphicsNeutralApp()) {
                 char modeText[8]{};
-                const DWORD modeLength = GetEnvironmentVariableA("OXRTK_GFX_BISECT", modeText, sizeof(modeText));
-                if (modeLength == 1 && modeText[0] >= '0' && modeText[0] <= '4') {
-                    m_gfxBisectMode = static_cast<uint32_t>(modeText[0] - '0');
+                const DWORD modeLength = GetEnvironmentVariableA("OXRTK_GFX_SUBBISECT", modeText, sizeof(modeText));
+                if (modeLength == 1 && modeText[0] >= '0' && modeText[0] <= '5') {
+                    m_gfxSubBisectMode = static_cast<uint32_t>(modeText[0] - '0');
                 } else if (modeLength != 0) {
-                    Log("[GFX-BISECT] app=%s invalid OXRTK_GFX_BISECT; using mode=0\n",
+                    Log("[GFX-SUBBISECT] app=%s invalid OXRTK_GFX_SUBBISECT; using submode=0\n",
                         m_applicationName.c_str());
                 }
+                // Submodes 0-3 share the hardware-stable Mode 2 device wrapper; 4-5 use Mode 3.
+                m_gfxBisectMode = m_gfxSubBisectMode >= 4 ? 3 : 2;
             }
             Log("Application name: '%s', Engine name: '%s'\n",
                 createInfo->applicationInfo.applicationName,
@@ -996,6 +998,7 @@ namespace {
                         Log("[GFX-BISECT] app=%s mode=%u requires D3D12; using mode=0\n",
                             m_applicationName.c_str(), m_gfxBisectMode);
                         m_gfxBisectMode = 0;
+                        m_gfxSubBisectMode = 0;
                     }
                     if (m_gfxBisectMode > 0) {
                         // Keep the wrapper alive, but do not expose private images or initialize the processing chain.
@@ -1016,6 +1019,7 @@ namespace {
                         m_applicationName.c_str(), m_gfxBisectMode, m_gfxBisectMode > 0,
                         m_gfxBisectMode > 0, m_gfxBisectMode == 2 ? "per_frame" :
                                                     m_gfxBisectMode == 1 ? "setup_only" : "none");
+                    logGraphicsSubBisectMode();
                     TraceLoggingWrite(g_traceProvider, "xrCreateSession", TLPArg(*session, "Session"));
                     return result;
                 }
@@ -1273,6 +1277,7 @@ namespace {
                             "command_lists=1 fences=1 flush=normal\n",
                             m_applicationName.c_str(), m_gfxBisectMode,
                             m_graphicsDevice->isEventsSupported(), !!m_frameAnalyzer);
+                        logGraphicsSubBisectMode();
                     }
                 } else {
                     Log("Unsupported graphics runtime.\n");
@@ -1379,8 +1384,9 @@ namespace {
             const XrResult result = OpenXrApi::xrDestroySession(session);
 
             if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session)) {
+                m_swapchains.clear();
                 if (m_bisectDevice) {
-                    // Modes 1/2 own a wrapper but never expose proxy images to the application.
+                    // Keep the D3D12 wrapper alive until its diagnostic textures have been released.
                     m_bisectDevice->flushContext(true);
                     m_bisectDevice->shutdown();
                     m_bisectDevice.reset();
@@ -1388,6 +1394,8 @@ namespace {
                 Log("[GFX-NEUTRAL] session destroyed session=%p direct_swapchains=%zu\n",
                     session, m_metroSwapchainIndices.size());
                 m_metroSwapchainIndices.clear();
+                m_subPendingDirectRelease.clear();
+                m_subProxySwapchains.clear();
                 m_metroGraphicsSession = XR_NULL_HANDLE;
             }
 
@@ -1457,10 +1465,58 @@ namespace {
                               TLArg(createInfo->usageFlags, "UsageFlags"));
 
             if (isMetroGraphicsSession(session)) {
+                if (m_gfxSubBisectMode == 2 || m_gfxSubBisectMode == 3) {
+                    // The runtime owns the swapchain. Only its color images are replaced for the app.
+                    const XrResult result = OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
+                    if (XR_FAILED(result)) {
+                        return result;
+                    }
+                    uint32_t imageCount = 0;
+                    CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(*swapchain, 0, &imageCount, nullptr));
+                    std::vector<XrSwapchainImageD3D12KHR> runtimeImages(imageCount,
+                                                                         {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+                    CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(
+                        *swapchain, imageCount, &imageCount,
+                        reinterpret_cast<XrSwapchainImageBaseHeader*>(runtimeImages.data())));
+                    SwapchainState state;
+                    state.requestedWidth = createInfo->width;
+                    state.requestedHeight = createInfo->height;
+                    state.requestedArraySize = createInfo->arraySize;
+                    const bool isDepth = (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+                    const D3D12_RESOURCE_STATES initialState = isDepth ? D3D12_RESOURCE_STATE_DEPTH_WRITE :
+                        (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) ?
+                            D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COMMON;
+                    for (uint32_t i = 0; i < imageCount; ++i) {
+                        SwapchainImages images;
+                        images.runtimeTexture = graphics::WrapD3D12Texture(
+                            m_bisectDevice, *createInfo, runtimeImages[i].texture, initialState,
+                            fmt::format("Sub-bisect runtime swapchain {} TEX2D", i));
+                        if (isDepth) {
+                            images.appTexture = images.runtimeTexture;
+                        } else {
+                            const auto format = static_cast<int64_t>(runtimeImages[i].texture->GetDesc().Format);
+                            images.appTexture = m_bisectDevice->createTexture(
+                                *createInfo, fmt::format("Sub-bisect app swapchain {} TEX2D", i), format);
+                        }
+                        state.images.push_back(std::move(images));
+                    }
+                    m_swapchains.insert_or_assign(*swapchain, std::move(state));
+                    m_subProxySwapchains.insert_or_assign(*swapchain, !isDepth);
+                    Log("[GFX-SUBBISECT] create app=%s submode=%u swapchain=%p requested=%ux%u "
+                        "arraySize=%u format=%lld sampleCount=%u usageFlags=0x%llx images=%u proxy=%u\n",
+                        m_applicationName.c_str(), m_gfxSubBisectMode, *swapchain, createInfo->width,
+                        createInfo->height, createInfo->arraySize, static_cast<long long>(createInfo->format),
+                        createInfo->sampleCount, static_cast<unsigned long long>(createInfo->usageFlags),
+                        imageCount, !isDepth);
+                    return result;
+                }
                 // Every image returned to this diagnostic application is owned by the runtime.
                 const XrResult result = OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
                 if (XR_SUCCEEDED(result)) {
                     m_metroSwapchainIndices.insert_or_assign(*swapchain, UINT32_MAX);
+                    if (m_gfxSubBisectMode == 1) {
+                        m_subPendingDirectRelease.insert_or_assign(*swapchain, false);
+                    }
                 }
                 Log("[GFX-NEUTRAL] create swapchain=%p result=%s requested=%ux%u arraySize=%u "
                     "format=%lld sampleCount=%u usageFlags=0x%llx runtime=%ux%u "
@@ -1675,6 +1731,8 @@ namespace {
             const XrResult result = OpenXrApi::xrDestroySwapchain(swapchain);
             if (XR_SUCCEEDED(result)) {
                 m_swapchains.erase(swapchain);
+                m_subProxySwapchains.erase(swapchain);
+                m_subPendingDirectRelease.erase(swapchain);
                 if (m_metroSwapchainIndices.erase(swapchain)) {
                     Log("[GFX-NEUTRAL] destroy swapchain=%p result=%s\n", swapchain, xr::ToCString(result));
                 }
@@ -1969,14 +2027,15 @@ namespace {
                     auto& swapchainState = swapchainIt->second;
 
                     // Return the application texture.
-                    if (m_graphicsDevice->getApi() == graphics::Api::D3D11) {
+                    const auto device = m_subProxySwapchains.count(swapchain) ? m_bisectDevice : m_graphicsDevice;
+                    if (device->getApi() == graphics::Api::D3D11) {
                         XrSwapchainImageD3D11KHR* d3dImages = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
                         for (uint32_t i = 0; i < *imageCountOutput; i++) {
                             d3dImages[i].texture = swapchainState.images[i].appTexture->getAs<graphics::D3D11>();
                             TraceLoggingWrite(
                                 g_traceProvider, "xrEnumerateSwapchainImages", TLPArg(d3dImages[i].texture, "Image"));
                         }
-                    } else if (m_graphicsDevice->getApi() == graphics::Api::D3D12) {
+                    } else if (device->getApi() == graphics::Api::D3D12) {
                         XrSwapchainImageD3D12KHR* d3dImages = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
                         for (uint32_t i = 0; i < *imageCountOutput; i++) {
                             d3dImages[i].texture = swapchainState.images[i].appTexture->getAs<graphics::D3D12>();
@@ -2003,7 +2062,7 @@ namespace {
             TraceLoggingWrite(
                 g_traceProvider, "xrWaitSwapchainImage", TLPArg(swapchain, "Swapchain"), TLArg(waitInfo->timeout));
 
-            if (m_metroSwapchainIndices.count(swapchain)) {
+            if (m_metroSwapchainIndices.count(swapchain) || m_subProxySwapchains.count(swapchain)) {
                 const XrResult result = OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);
                 if (m_metroGfxWaitLogs.fetch_add(1) < MetroGfxLogSamples) {
                     Log("[GFX-NEUTRAL] wait swapchain=%p timeout_requested=%lld timeout_forwarded=%lld "
@@ -2031,6 +2090,9 @@ namespace {
 
             auto metroSwapchainIt = m_metroSwapchainIndices.find(swapchain);
             if (metroSwapchainIt != m_metroSwapchainIndices.end()) {
+                if (m_subPendingDirectRelease.count(swapchain) && m_subPendingDirectRelease[swapchain]) {
+                    CHECK_XRCMD(releaseSubDirectImage(swapchain, "acquire"));
+                }
                 const XrResult result = OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
                 if (XR_SUCCEEDED(result)) {
                     metroSwapchainIt->second = *index;
@@ -2052,10 +2114,13 @@ namespace {
                 // Perform the release now in case it was delayed.
                 if (swapchainIt->second.delayedRelease) {
                     TraceLoggingWrite(g_traceProvider, "ForcedSwapchainRelease", TLPArg(swapchain, "Swapchain"));
-
-                    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, nullptr};
-                    swapchainIt->second.delayedRelease = false;
-                    CHECK_XRCMD(OpenXrApi::xrReleaseSwapchainImage(swapchain, &releaseInfo));
+                    if (m_subProxySwapchains.count(swapchain)) {
+                        CHECK_XRCMD(releaseSubProxyImage(swapchain, "acquire"));
+                    } else {
+                        XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, nullptr};
+                        swapchainIt->second.delayedRelease = false;
+                        CHECK_XRCMD(OpenXrApi::xrReleaseSwapchainImage(swapchain, &releaseInfo));
+                    }
                 }
             }
 
@@ -2064,6 +2129,13 @@ namespace {
                 // Record the index so we know which texture to use in xrEndFrame().
                 if (swapchainIt != m_swapchains.end()) {
                     swapchainIt->second.acquiredImageIndex = *index;
+                    if (m_subProxySwapchains.count(swapchain) &&
+                        m_metroGfxAcquireLogs.fetch_add(1) < MetroGfxLogSamples) {
+                        Log("[GFX-SUBBISECT] app=%s submode=%u acquire swapchain=%p "
+                            "runtime_index=%u proxy_index=%u proxy=%u\n",
+                            m_applicationName.c_str(), m_gfxSubBisectMode, swapchain, *index, *index,
+                            m_subProxySwapchains.at(swapchain));
+                    }
                 }
 
                 TraceLoggingWrite(g_traceProvider, "xrAcquireSwapchainImage", TLArg(*index, "Index"));
@@ -2088,6 +2160,15 @@ namespace {
             auto metroSwapchainIt = m_metroSwapchainIndices.find(swapchain);
             if (metroSwapchainIt != m_metroSwapchainIndices.end()) {
                 const uint32_t releasedIndex = metroSwapchainIt->second;
+                if (m_subPendingDirectRelease.count(swapchain)) {
+                    m_subPendingDirectRelease[swapchain] = true;
+                    if (m_subReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
+                        Log("[GFX-SUBBISECT] app=%s submode=1 release_requested swapchain=%p runtime_index=%u "
+                            "downstream_release=deferred_to_endFrame\n",
+                            m_applicationName.c_str(), swapchain, releasedIndex);
+                    }
+                    return XR_SUCCESS;
+                }
                 const XrResult result = OpenXrApi::xrReleaseSwapchainImage(swapchain, releaseInfo);
                 if (XR_SUCCEEDED(result)) {
                     metroSwapchainIt->second = UINT32_MAX;
@@ -2102,6 +2183,19 @@ namespace {
 
             auto swapchainIt = m_swapchains.find(swapchain);
             if (swapchainIt != m_swapchains.end()) {
+                if (m_subProxySwapchains.count(swapchain)) {
+                    if (m_gfxSubBisectMode == 2) {
+                        return releaseSubProxyImage(swapchain, "release", releaseInfo);
+                    }
+                    swapchainIt->second.delayedRelease = true;
+                    if (m_subReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
+                        Log("[GFX-SUBBISECT] app=%s submode=3 release_requested swapchain=%p "
+                            "runtime_index=%u proxy_index=%u downstream_release=deferred_to_endFrame\n",
+                            m_applicationName.c_str(), swapchain, swapchainIt->second.acquiredImageIndex,
+                            swapchainIt->second.acquiredImageIndex);
+                    }
+                    return XR_SUCCESS;
+                }
                 if (m_frameAnalyzer) {
                     m_frameAnalyzer->onReleaseSwapchain(swapchain);
                 }
@@ -2912,13 +3006,23 @@ namespace {
 
             // Release the swapchain images. Some runtimes don't seem to look cross-frame releasing and this can happen
             // when a frame is discarded.
+            if (isMetroGraphicsSession(session) && m_gfxSubBisectMode == 1) {
+                for (const auto& pending : m_subPendingDirectRelease) {
+                    if (pending.second) {
+                        CHECK_XRCMD(releaseSubDirectImage(pending.first, "beginFrame"));
+                    }
+                }
+            }
             for (auto& swapchain : m_swapchains) {
                 if (swapchain.second.delayedRelease) {
                     TraceLoggingWrite(g_traceProvider, "ForcedSwapchainRelease", TLPArg(swapchain.first, "Swapchain"));
-
-                    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                    swapchain.second.delayedRelease = false;
-                    CHECK_XRCMD(OpenXrApi::xrReleaseSwapchainImage(swapchain.first, &releaseInfo));
+                    if (m_subProxySwapchains.count(swapchain.first)) {
+                        CHECK_XRCMD(releaseSubProxyImage(swapchain.first, "beginFrame"));
+                    } else {
+                        XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        swapchain.second.delayedRelease = false;
+                        CHECK_XRCMD(OpenXrApi::xrReleaseSwapchainImage(swapchain.first, &releaseInfo));
+                    }
                 }
             }
 
@@ -3194,7 +3298,7 @@ namespace {
                             const std::string& suffix,
                             const XrRect2Di& viewport) const {
             // Stamp the overlay/menu if it's active.
-            if (m_menuHandler) {
+            if (m_menuHandler && !isSubBisectOverlaySuppressed()) {
                 m_graphicsDevice->setRenderTargets(1, &texture, nullptr, &viewport);
                 m_graphicsDevice->beginText(true /* mustKeepOldContent */);
                 m_menuHandler->render(texture);
@@ -3263,19 +3367,33 @@ namespace {
                               TLArg(xr::ToCString(frameEndInfo->environmentBlendMode), "EnvironmentBlendMode"));
 
             if (isMetroGraphicsSession(session)) {
-                // The application received the runtime's real images and released them directly to the runtime.
-                // Unlike a proxy swapchain, there is no Toolkit image to copy or translate before submission.
+                // Complete every pending release before the runtime sees the submitted composition layers.
+                if (m_gfxSubBisectMode == 1) {
+                    for (const auto& pending : m_subPendingDirectRelease) {
+                        if (pending.second) {
+                            CHECK_XRCMD(releaseSubDirectImage(pending.first, "endFrame"));
+                        }
+                    }
+                } else if (m_gfxSubBisectMode == 3) {
+                    for (const auto& state : m_subProxySwapchains) {
+                        if (m_swapchains.at(state.first).delayedRelease) {
+                            CHECK_XRCMD(releaseSubProxyImage(state.first, "endFrame"));
+                        }
+                    }
+                }
                 const uint32_t sample = m_metroGfxEndLogs.fetch_add(1);
                 if (m_gfxBisectMode == 2) {
                     m_bisectDevice->flushContext();
                 }
                 if (sample < MetroGfxLogSamples) {
                     Log("[GFX-NEUTRAL] end sample=%u displayTime=%lld layers=%u "
-                        "runtime_swapchains=direct app_to_runtime_copy=0 postprocess=0 "
+                        "runtime_swapchains=%s app_to_runtime_copy=%u postprocess=0 "
                         "frame_analyzer=0 interceptor=0 toolkit_flushContext=%u "
                         "toolkit_command_lists=%u toolkit_fences=%u "
                         "resource_state_before=unobserved resource_state_after=unobserved\n",
                         sample, static_cast<long long>(frameEndInfo->displayTime), frameEndInfo->layerCount,
+                        m_gfxSubBisectMode >= 2 ? "proxy_color" : "direct",
+                        m_gfxSubBisectMode >= 2,
                         m_gfxBisectMode == 2, m_gfxBisectMode > 0, m_gfxBisectMode > 0);
                     for (uint32_t i = 0; frameEndInfo->layers && i < frameEndInfo->layerCount; i++) {
                         if (frameEndInfo->layers[i] &&
@@ -3343,7 +3461,7 @@ namespace {
             m_graphicsDevice->saveContext();
 
             // Handle inputs.
-            if (m_menuHandler) {
+            if (m_menuHandler && !isSubBisectOverlaySuppressed()) {
                 // Defer creating the menu swapchain to avoid issues with OpenComposite double-initialization.
                 if (m_menuSwapchain == XR_NULL_HANDLE) {
                     createMenuSwapchain();
@@ -3816,10 +3934,10 @@ namespace {
             // Render our overlays.
             bool needMenuSwapchainDelayedRelease = false;
             {
-                const bool drawHands = m_handTracker && m_configManager->peekEnumValue<config::HandTrackingVisibility>(
+                const bool drawHands = !isSubBisectOverlaySuppressed() && m_handTracker && m_configManager->peekEnumValue<config::HandTrackingVisibility>(
                                                             config::SettingHandVisibilityAndSkinTone) !=
                                                             config::HandTrackingVisibility::Hidden;
-                const bool drawEyeGaze = m_eyeTracker && m_configManager->getValue(config::SettingEyeDebug);
+                const bool drawEyeGaze = !isSubBisectOverlaySuppressed() && m_eyeTracker && m_configManager->getValue(config::SettingEyeDebug);
 
                 m_stats.overlayCpuTimeUs += m_performanceCounters.overlayCpuTimer->query();
                 m_stats.overlayGpuTimeUs +=
@@ -3871,7 +3989,7 @@ namespace {
                 }
 
                 // Render the menu.
-                if (m_menuHandler) {
+                if (m_menuHandler && !isSubBisectOverlaySuppressed()) {
                     if (!m_configManager->getValue(config::SettingMenuLegacyMode) && !m_configManager->isSafeMode()) {
                         if (m_menuHandler->isVisible() || m_menuLingering) {
                             TraceLoggingWrite(g_traceProvider, "OverlayMenu");
@@ -4101,6 +4219,72 @@ namespace {
             return m_metroGraphicsSession != XR_NULL_HANDLE && session == m_metroGraphicsSession;
         }
 
+        bool isSubBisectOverlaySuppressed() const {
+            return isGraphicsNeutralApp() && m_gfxSubBisectMode == 4;
+        }
+
+        void logGraphicsSubBisectMode() const {
+            static constexpr const char* copyPoint[] = {"none", "none", "release", "endFrame",
+                                                       "processing_chain", "processing_chain"};
+            const uint32_t mode = m_gfxSubBisectMode;
+            Log("[GFX-SUBBISECT] app=%s submode=%u proxy=%u runtime_image_exposed=%u "
+                "delayed_release=%u copy=%u copy_point=%s overlay=%u postprocess=%u "
+                "command_lists=1 fences=1 flush=%s interceptor=0 analyzer=0\n",
+                m_applicationName.c_str(), mode, mode >= 2, mode < 2, mode == 1 || mode == 3 || mode >= 4,
+                mode >= 2, copyPoint[mode], mode == 5, mode >= 4,
+                mode >= 4 ? "normal" : "mode2_plus_copy_if_needed");
+        }
+
+        XrResult releaseSubDirectImage(XrSwapchain swapchain, const char* point) {
+            XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            const uint32_t imageIndex = m_metroSwapchainIndices.at(swapchain);
+            const XrResult result = OpenXrApi::xrReleaseSwapchainImage(swapchain, &info);
+            if (XR_SUCCEEDED(result)) {
+                m_subPendingDirectRelease[swapchain] = false;
+                m_metroSwapchainIndices[swapchain] = UINT32_MAX;
+            }
+            if (m_subReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
+                Log("[GFX-SUBBISECT] app=%s submode=1 downstream_release point=%s swapchain=%p "
+                    "runtime_index=%u result=%s copy=0\n", m_applicationName.c_str(), point,
+                    swapchain, imageIndex, xr::ToCString(result));
+            }
+            return result;
+        }
+
+        XrResult releaseSubProxyImage(XrSwapchain swapchain, const char* point,
+                                      const XrSwapchainImageReleaseInfo* originalInfo = nullptr) {
+            auto& state = m_swapchains.at(swapchain);
+            const uint32_t imageIndex = state.acquiredImageIndex;
+            const bool hasProxy = m_subProxySwapchains.at(swapchain);
+            if (hasProxy) {
+                auto& images = state.images.at(imageIndex);
+                // CopyResource covers every mip and array slice. ITexture::copyTo() copies only slice zero.
+                images.appTexture->pushState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+                images.runtimeTexture->pushState(D3D12_RESOURCE_STATE_COPY_DEST);
+                m_bisectDevice->getContextAs<graphics::D3D12>()->CopyResource(
+                    images.runtimeTexture->getAs<graphics::D3D12>(),
+                    images.appTexture->getAs<graphics::D3D12>());
+                images.runtimeTexture->popState();
+                images.appTexture->popState();
+                // Submit the copy on the application's queue before telling the runtime the image is ready.
+                m_bisectDevice->flushContext();
+            }
+            XrSwapchainImageReleaseInfo defaultInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            const XrResult result = OpenXrApi::xrReleaseSwapchainImage(
+                swapchain, originalInfo ? originalInfo : &defaultInfo);
+            if (XR_SUCCEEDED(result)) {
+                state.delayedRelease = false;
+            }
+            if (m_subReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
+                Log("[GFX-SUBBISECT] app=%s submode=%u downstream_release point=%s swapchain=%p "
+                    "runtime_index=%u proxy_index=%u copy=%u arraySize=%u command_list=%u "
+                    "fence_wait=0 result=%s\n", m_applicationName.c_str(), m_gfxSubBisectMode,
+                    point, swapchain, imageIndex, imageIndex, hasProxy, state.requestedArraySize,
+                    hasProxy, xr::ToCString(result));
+            }
+            return result;
+        }
+
         const std::string getPath(XrPath path) {
             if (path == XR_NULL_PATH) {
                 return "";
@@ -4193,9 +4377,13 @@ namespace {
         XrSystemId m_vrSystemId{XR_NULL_SYSTEM_ID};
         XrSession m_vrSession{XR_NULL_HANDLE};
         uint32_t m_gfxBisectMode{0};
+        uint32_t m_gfxSubBisectMode{0};
         std::shared_ptr<graphics::IDevice> m_bisectDevice;
         XrSession m_metroGraphicsSession{XR_NULL_HANDLE};
         std::map<XrSwapchain, uint32_t> m_metroSwapchainIndices;
+        std::map<XrSwapchain, bool> m_subPendingDirectRelease;
+        std::map<XrSwapchain, bool> m_subProxySwapchains;
+        std::atomic<uint32_t> m_subReleaseLogs{0};
         std::atomic<uint32_t> m_metroGfxEnumerationLogs{0};
         std::atomic<uint32_t> m_metroGfxImageLogs{0};
         std::atomic<uint32_t> m_metroGfxWaitLogs{0};
