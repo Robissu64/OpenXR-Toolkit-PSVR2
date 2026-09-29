@@ -40,6 +40,32 @@ namespace {
     // The xrWaitFrame() loop might cause to have 2 frames in-flight, so we want to delay the GPU timer re-use by those
     // 2 frames.
     constexpr uint32_t GpuTimerLatency = 2;
+    constexpr uint32_t MetroPoseLogSamples = 4;
+
+    void LogMetroPoseFov(const char* stage,
+                         uint32_t sample,
+                         XrTime displayTime,
+                         uint32_t eye,
+                         const XrPosef& pose,
+                         const XrFovf& fov) {
+        Log("[METRO-POSE] %s sample=%u displayTime=%lld eye=%u pos=(%.6f,%.6f,%.6f) "
+            "orientation=(%.6f,%.6f,%.6f,%.6f) fov=(%.6f,%.6f,%.6f,%.6f)\n",
+            stage, sample, static_cast<long long>(displayTime), eye,
+            pose.position.x, pose.position.y, pose.position.z,
+            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
+            fov.angleLeft, fov.angleRight, fov.angleUp, fov.angleDown);
+    }
+
+    bool SameMetroPose(const XrPosef& a, const XrPosef& b) {
+        return a.position.x == b.position.x && a.position.y == b.position.y && a.position.z == b.position.z &&
+               a.orientation.x == b.orientation.x && a.orientation.y == b.orientation.y &&
+               a.orientation.z == b.orientation.z && a.orientation.w == b.orientation.w;
+    }
+
+    bool SameMetroFov(const XrFovf& a, const XrFovf& b) {
+        return a.angleLeft == b.angleLeft && a.angleRight == b.angleRight &&
+               a.angleUp == b.angleUp && a.angleDown == b.angleDown;
+    }
 
     // Keep this transformation identical to the simple-FOV path in xrLocateViews().
     XrFovf ScaleSimpleFov(XrFovf fov, int percent) {
@@ -2132,6 +2158,23 @@ namespace {
                 viewCapacityInput) {
                 assert(*viewCountOutput == utilities::ViewCount);
                 using namespace DirectX;
+                const bool metroPoseNeutral = m_applicationName == "Impact";
+                const uint32_t metroSample = metroPoseNeutral ? m_metroLocateSamples.fetch_add(1) : 0;
+                const bool logMetroPose = metroPoseNeutral && metroSample < MetroPoseLogSamples;
+                if (logMetroPose) {
+                    Log("[METRO-POSE] locate policy sample=%u safe_mode=%u parallel=%u canting=%d "
+                        "world_scale=%d fov_type=%d fov_percent=%d zoom=%d crop_active=%u "
+                        "optional_pose_fov_transforms=skipped\n",
+                        metroSample, m_configManager->isSafeMode(), m_overrideParallelProjection,
+                        m_configManager->peekValue("canting"), m_configManager->peekValue(config::SettingICD),
+                        m_configManager->peekValue(config::SettingFOVType),
+                        m_configManager->peekValue(config::SettingFOV),
+                        m_configManager->peekValue(config::SettingZoom), m_cropActive);
+                    for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                        LogMetroPoseFov("locate_runtime", metroSample, viewLocateInfo->displayTime, eye,
+                                        views[eye].pose, views[eye].fov);
+                    }
+                }
 
                 const XrFovf originalFov[utilities::ViewCount] = {views[0].fov, views[1].fov};
                 if (!m_cropCalibrationIdentity.empty() && !m_cropCalibrationChecked) {
@@ -2178,7 +2221,7 @@ namespace {
                 m_posesForFrame[1].pose = views[1].pose;
 
                 // Fix Fallout 4 / OpenComposite Decal Issue for WMR
-                if (m_overrideParallelProjection) {
+                if (m_overrideParallelProjection && !metroPoseNeutral) {
                     views[0].pose.orientation.w = views[1].pose.orientation.w;
                     views[0].pose.orientation.x = views[1].pose.orientation.x;
                     views[0].pose.orientation.y = views[1].pose.orientation.y;
@@ -2187,7 +2230,7 @@ namespace {
 
                 // Override the canting angle if requested.
                 const int cantOverride = m_configManager->getValue("canting");
-                if (cantOverride != 0) {
+                if (cantOverride != 0 && !metroPoseNeutral) {
                     const float angle = (float)(cantOverride * (M_PI / 180));
 
                     StoreXrPose(&views[0].pose,
@@ -2238,7 +2281,7 @@ namespace {
 
                 // Override the ICD if requested.
                 const int icdOverride = m_configManager->getValue(config::SettingICD);
-                if (icdOverride != 1000) {
+                if (icdOverride != 1000 && !metroPoseNeutral) {
                     const float icd = (ipd * 1000) / std::max(icdOverride, 1);
                     const auto center = views[0].pose.position + (vec * 0.5f);
                     const auto offset = Normalize(vec) * (icd * 0.5f);
@@ -2251,7 +2294,9 @@ namespace {
                 }
 
                 // Override the FOV if requested.
-                if ((m_cropActive ? 0 : m_configManager->getValue(config::SettingFOVType)) == 0) {
+                if (metroPoseNeutral) {
+                    // Keep the runtime FOVs exactly as returned for this diagnostic application.
+                } else if ((m_cropActive ? 0 : m_configManager->getValue(config::SettingFOVType)) == 0) {
                     const auto fovOverride = m_cropActive ? m_cropFovPercent :
                                                            m_configManager->getValue(config::SettingFOV);
                     views[0].fov = ScaleSimpleFov(views[0].fov, fovOverride);
@@ -2305,9 +2350,16 @@ namespace {
 
                 // Apply zoom if requested.
                 const auto zoom = m_configManager->getValue(config::SettingZoom);
-                if (zoom != 10) {
+                if (zoom != 10 && !metroPoseNeutral) {
                     StoreXrFov(&views[0].fov, LoadXrFov(views[0].fov) * XMVectorReplicate(1.f / (zoom * 0.1f)));
                     StoreXrFov(&views[1].fov, LoadXrFov(views[1].fov) * XMVectorReplicate(1.f / (zoom * 0.1f)));
+                }
+
+                if (logMetroPose) {
+                    for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                        LogMetroPoseFov("locate_delivered", metroSample, viewLocateInfo->displayTime, eye,
+                                        views[eye].pose, views[eye].fov);
+                    }
                 }
 
                 TraceLoggingWrite(g_traceProvider,
@@ -2634,7 +2686,8 @@ namespace {
             std::unique_lock lock(m_frameLock);
 
             XrResult result = XR_ERROR_RUNTIME_FAILURE;
-            if (isVrSession(session) && m_asyncWaitPromise.valid()) {
+            const bool asyncWaitUsed = isVrSession(session) && m_asyncWaitPromise.valid();
+            if (asyncWaitUsed) {
                 TraceLoggingWrite(g_traceProvider, "AsyncWaitMode");
 
                 // In Turbo mode, we accept pipelining of exactly one frame.
@@ -2669,13 +2722,16 @@ namespace {
                 }
             }
             if (XR_SUCCEEDED(result) && isVrSession(session)) {
+                const bool metroPoseNeutral = m_applicationName == "Impact";
+                const XrTime predictedBeforeToolkit = frameState->predictedDisplayTime;
+                const XrTime previousWaitedTime = m_waitedFrameTime;
                 m_performanceCounters.waitCpuTimer->stop();
                 m_stats.waitCpuTimeUs += m_performanceCounters.waitCpuTimer->query();
 
                 m_savedFrameTime1 = frameState->predictedDisplayTime;
 
                 // Apply prediction dampening if possible and if needed.
-                if (m_hasPerformanceCounterKHR) {
+                if (m_hasPerformanceCounterKHR && !metroPoseNeutral) {
                     const int predictionDampen = m_configManager->getValue(config::SettingPredictionDampen);
                     if (predictionDampen != 100) {
                         // Find the current time.
@@ -2696,10 +2752,26 @@ namespace {
                 }
 
                 // Per OpenXR spec, the predicted display must increase monotonically.
-                frameState->predictedDisplayTime = std::max(frameState->predictedDisplayTime, m_waitedFrameTime + 1);
+                if (!metroPoseNeutral) {
+                    frameState->predictedDisplayTime = std::max(frameState->predictedDisplayTime, m_waitedFrameTime + 1);
+                }
 
                 // Record the predicted display time.
                 m_waitedFrameTime = frameState->predictedDisplayTime;
+
+                if (metroPoseNeutral) {
+                    const uint32_t sample = m_metroWaitSamples.fetch_add(1);
+                    if (sample < MetroPoseLogSamples) {
+                        Log("[METRO-POSE] wait sample=%u source=%s raw_predicted=%lld delivered=%lld "
+                            "previous_waited=%lld would_clamp=%u period=%lld shouldRender=%u prediction_setting=%d "
+                            "dampening=skipped monotonic_clamp=skipped\n",
+                            sample, asyncWaitUsed ? "turbo_async_estimate" : "runtime",
+                            (long long)predictedBeforeToolkit, (long long)frameState->predictedDisplayTime,
+                            (long long)previousWaitedTime, predictedBeforeToolkit <= previousWaitedTime,
+                            (long long)frameState->predictedDisplayPeriod,
+                            frameState->shouldRender, m_configManager->peekValue(config::SettingPredictionDampen));
+                    }
+                }
 
                 if (m_graphicsDevice) {
                     m_performanceCounters.appCpuTimer->start();
@@ -2751,6 +2823,15 @@ namespace {
                 m_begunFrameTime = m_waitedFrameTime;
                 m_savedFrameTime2 = m_savedFrameTime1;
                 m_isInFrame = true;
+
+                if (m_applicationName == "Impact") {
+                    const uint32_t sample = m_metroBeginSamples.fetch_add(1);
+                    if (sample < MetroPoseLogSamples) {
+                        Log("[METRO-POSE] begin sample=%u displayTime=%lld raw_wait_time=%lld turbo_async=%u\n",
+                            sample, (long long)m_begunFrameTime, (long long)m_savedFrameTime2,
+                            m_asyncWaitPromise.valid());
+                    }
+                }
 
                 if (m_graphicsDevice) {
                     m_performanceCounters.renderCpuTimer->start();
@@ -3073,6 +3154,20 @@ namespace {
             }
 
             std::unique_lock lock(m_frameLock);
+            const bool metroPoseNeutral = m_applicationName == "Impact";
+            const uint32_t metroSample = metroPoseNeutral ? m_metroEndSamples.fetch_add(1) : 0;
+            const bool logMetroPose = metroPoseNeutral && metroSample < MetroPoseLogSamples;
+            if (logMetroPose) {
+                Log("[METRO-POSE] endframe policy sample=%u safe_mode=%u canting=%d world_scale=%d "
+                    "fov_type=%d fov_percent=%d zoom=%d crop_active=%u pose_fov_overrides=skipped "
+                    "input_displayTime=%lld input_layers=%u\n",
+                    metroSample, m_configManager->isSafeMode(), m_configManager->peekValue("canting"),
+                    m_configManager->peekValue(config::SettingICD),
+                    m_configManager->peekValue(config::SettingFOVType),
+                    m_configManager->peekValue(config::SettingFOV),
+                    m_configManager->peekValue(config::SettingZoom), m_cropActive,
+                    (long long)frameEndInfo->displayTime, frameEndInfo->layerCount);
+            }
 
             m_isInFrame = false;
 
@@ -3181,6 +3276,11 @@ namespace {
                     assert(proj->viewCount == utilities::ViewCount);
                     for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
                         const XrCompositionLayerProjectionView& view = proj->views[eye];
+                        if (logMetroPose) {
+                            Log("[METRO-POSE] endframe_received sample=%u layer=%u\n", metroSample, i);
+                            LogMetroPoseFov("endframe_received", metroSample, frameEndInfo->displayTime, eye,
+                                            view.pose, view.fov);
+                        }
 
                         TraceLoggingWrite(g_traceProvider,
                                           "xrEndFrame_View",
@@ -3476,15 +3576,15 @@ namespace {
                         depthForOverlay[eye] = depthBuffer;
 
                         // Patch the eye poses.
-                        if (m_configManager->getValue("canting")) {
+                        if (!metroPoseNeutral && m_configManager->getValue("canting")) {
                             correctedProjectionViews[eye].pose = m_posesForFrame[eye].pose;
                         }
 
                         // Patch the FOV if it was overriden.
                         const auto fovOverrideMode = m_configManager->peekValue(config::SettingFOVType);
-                        if (m_cropActive ||
+                        if (!metroPoseNeutral && (m_cropActive ||
                             (fovOverrideMode == 0 && m_configManager->peekValue(config::SettingFOV) != 100) ||
-                            fovOverrideMode == 1 || m_configManager->peekValue(config::SettingZoom) != 10) {
+                            fovOverrideMode == 1 || m_configManager->peekValue(config::SettingZoom) != 10)) {
                             const bool yflip = correctedProjectionViews[eye].fov.angleDown > 0 &&
                                                correctedProjectionViews[eye].fov.angleUp < 0;
 
@@ -3506,7 +3606,7 @@ namespace {
                     }
 
                     const int icdOverride = m_configManager->getValue(config::SettingICD);
-                    if (icdOverride != 1000) {
+                    if (icdOverride != 1000 && !metroPoseNeutral) {
                         // Restore the original IPD to avoid reprojection being confused.
                         const auto vec =
                             correctedProjectionViews[1].pose.position - correctedProjectionViews[0].pose.position;
@@ -3522,6 +3622,14 @@ namespace {
                     spaceForOverlay = proj->space;
 
                     for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                        if (logMetroPose) {
+                            LogMetroPoseFov("endframe_forwarded", metroSample, chainFrameEndInfo.displayTime, eye,
+                                            correctedProjectionViews[eye].pose, correctedProjectionViews[eye].fov);
+                            Log("[METRO-POSE] view_compare sample=%u layer=%u eye=%u pose_changed=%u fov_changed=%u\n",
+                                metroSample, i, eye,
+                                !SameMetroPose(proj->views[eye].pose, correctedProjectionViews[eye].pose),
+                                !SameMetroFov(proj->views[eye].fov, correctedProjectionViews[eye].fov));
+                        }
                         TraceLoggingWrite(
                             g_traceProvider,
                             "CorrectedView",
@@ -3816,6 +3924,13 @@ namespace {
                 }
 
                 const auto result = OpenXrApi::xrEndFrame(session, &chainFrameEndInfo);
+                if (logMetroPose) {
+                    Log("[METRO-POSE] submit sample=%u input_displayTime=%lld forwarded_displayTime=%lld "
+                        "input_layers=%u forwarded_layers=%u result=%s\n",
+                        metroSample, (long long)frameEndInfo->displayTime,
+                        (long long)chainFrameEndInfo.displayTime, frameEndInfo->layerCount,
+                        chainFrameEndInfo.layerCount, xr::ToCString(result));
+                }
 
                 m_graphicsDevice->unblockCallbacks();
 
@@ -3943,6 +4058,10 @@ namespace {
         }
 
         std::string m_applicationName;
+        std::atomic<uint32_t> m_metroLocateSamples{0};
+        std::atomic<uint32_t> m_metroWaitSamples{0};
+        std::atomic<uint32_t> m_metroBeginSamples{0};
+        std::atomic<uint32_t> m_metroEndSamples{0};
         bool m_isOpenComposite{false};
         bool m_isUnity{false};
         std::string m_runtimeName;
