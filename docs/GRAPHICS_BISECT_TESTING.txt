@@ -1,0 +1,85 @@
+OpenXR Toolkit PSVR2 - graphics path bisect (diagnostic build)
+===========================================================
+
+This build affects only OpenXR application names Impact (Metro Awakening) and
+TheMidnightWalk (The Midnight Walk). It is not a final fix. No rebuild is needed
+between modes. OXRTK_GFX_BISECT is read when the game process starts.
+
+Mode 0 (default): Proven graphics-neutral path. Direct runtime swapchains; no
+Toolkit D3D12 wrapper, proxy images, extra command lists, copies, or flush.
+
+Mode 1: Mode 0 plus a D3D12 wrapper kept alive for the session. The wrapper
+allocates command lists and a fence and may submit setup work. Its interceptor
+is forced off. It performs no per-frame Toolkit flush and still exposes direct
+runtime swapchains to the game.
+
+Mode 2: Mode 1 plus nonblocking Toolkit flushContext() at xrBeginFrame and
+before xrEndFrame. This submits Toolkit command lists on the application queue
+without introducing proxy swapchains or a per-frame blocking fence wait.
+
+Mode 3: Normal Toolkit proxy swapchains, delayed image release, processing
+chain, intermediate textures when required, and normal command submission.
+The D3D12 graphics interceptor is forced off; Frame Analyzer and intercepted
+foveated rendering are unavailable.
+
+Mode 4: Normal v1.1 graphics path. Proxy swapchains, processing, and the
+interceptor/Frame Analyzer follow the existing settings, including Safe Mode.
+To distinguish modes 3 and 4, keep Safe Mode OFF and the interceptor enabled.
+
+IMPORTANT: Proxy images, delayed release and the processing chain are enabled
+together in modes 3/4. Separating them could submit images that were never
+copied to runtime swapchains, resulting in a black headset image.
+
+How to run a single test
+------------------------
+1. Install this diagnostic artifact's layer using the included installer.
+2. Completely exit the game, SteamVR and Steam (including the Steam tray icon).
+3. Open PowerShell. Run ONE of the commands below. Each command reads Steam's
+   installed executable path from the Windows registry, sets the environment
+   variable, starts a fresh Steam process, and launches the selected game.
+4. If The Midnight Walk offers launch modes, choose its VR mode.
+5. Confirm the log contains exactly one [GFX-BISECT] line for the selected app
+   and mode. Record whether the headset is stable, wobbles, or shows black.
+6. Exit the game, SteamVR and Steam completely before changing modes. Keep all
+   in-game and Toolkit settings the same for every run. In particular, leave
+   Eye Tracking, FOV Crop and upscaling off for the first comparison.
+
+Metro Awakening (Steam app 2669410)
+------------------------------------
+Mode 0:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '0'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Mode 1:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '1'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Mode 2:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '2'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Mode 3:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '3'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+Mode 4:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '4'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+
+The Midnight Walk (Steam app 2863640)
+--------------------------------------
+Mode 0:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '0'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Mode 1:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '1'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Mode 2:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '2'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Mode 3:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '3'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+Mode 4:
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe; $env:OXRTK_GFX_BISECT = '4'; Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+
+Log interpretation
+------------------
+The single [GFX-BISECT] session line reports which components were enabled.
+"intermediate=conditional" means VPRT/texture-array layout or upscaling may
+require additional textures. "copy=processing_chain" means the Toolkit renders
+or copies from its private image to the runtime image; the exact copy pattern
+depends on the submitted projection layout.
+
+XR_FRAME_DISCARDED is a successful xrBeginFrame result when the prior begun
+frame was not ended. XR_ERROR_CALL_ORDER_INVALID can mean xrBeginFrame lacked
+a matching successful xrWaitFrame or xrEndFrame lacked a successful xrBeginFrame.
+The stable Midnight Walk log alone does not identify the exact call responsible.
+These codes are recorded for comparison; this build does not change frame order.

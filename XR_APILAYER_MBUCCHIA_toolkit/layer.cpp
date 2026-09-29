@@ -361,6 +361,16 @@ namespace {
                 hasEyeTrackerFB = XR_SUCCEEDED(xrGetInstanceProcAddr(GetXrInstance(), "xrCreateEyeTrackerFB", &unused));
             }
             m_applicationName = createInfo->applicationInfo.applicationName;
+            if (isGraphicsNeutralApp()) {
+                char modeText[8]{};
+                const DWORD modeLength = GetEnvironmentVariableA("OXRTK_GFX_BISECT", modeText, sizeof(modeText));
+                if (modeLength == 1 && modeText[0] >= '0' && modeText[0] <= '4') {
+                    m_gfxBisectMode = static_cast<uint32_t>(modeText[0] - '0');
+                } else if (modeLength != 0) {
+                    Log("[GFX-BISECT] app=%s invalid OXRTK_GFX_BISECT; using mode=0\n",
+                        m_applicationName.c_str());
+                }
+            }
             Log("Application name: '%s', Engine name: '%s'\n",
                 createInfo->applicationInfo.applicationName,
                 createInfo->applicationInfo.engineName);
@@ -833,7 +843,7 @@ namespace {
 
             const XrResult result = OpenXrApi::xrEnumerateViewConfigurationViews(
                 instance, systemId, viewConfigurationType, viewCapacityInput, viewCountOutput, views);
-            if (isGraphicsNeutralApp()) {
+            if (isGraphicsNeutralApp() && m_gfxBisectMode <= 2) {
                 if (XR_SUCCEEDED(result) && views && m_metroGfxEnumerationLogs.fetch_add(1) < MetroGfxLogSamples) {
                     for (uint32_t eye = 0; eye < *viewCountOutput; eye++) {
                         Log("[GFX-NEUTRAL] recommended eye=%u runtime=%ux%u delivered=%ux%u "
@@ -951,9 +961,23 @@ namespace {
 
             const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
             if (XR_SUCCEEDED(result) && isVrSystem(createInfo->systemId)) {
-                if (isGraphicsNeutralApp()) {
+                if (isGraphicsNeutralApp() && m_gfxBisectMode >= 3) {
+                    bool hasD3D12Binding = false;
+                    auto binding = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
+                    while (binding) {
+                        hasD3D12Binding |= binding->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
+                        binding = binding->next;
+                    }
+                    if (!hasD3D12Binding) {
+                        Log("[GFX-BISECT] app=%s mode=%u requires D3D12; using mode=0\n",
+                            m_applicationName.c_str(), m_gfxBisectMode);
+                        m_gfxBisectMode = 0;
+                    }
+                }
+                if (isGraphicsNeutralApp() && m_gfxBisectMode <= 2) {
                     const char* graphicsApi = "unknown";
                     const void* appQueue = nullptr;
+                    const XrGraphicsBindingD3D12KHR* d3d12Bindings = nullptr;
                     auto entry = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
                     while (entry) {
                         if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
@@ -962,16 +986,36 @@ namespace {
                         }
                         if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
                             graphicsApi = "D3D12";
-                            appQueue = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(entry)->queue;
+                            d3d12Bindings = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(entry);
+                            appQueue = d3d12Bindings->queue;
                             break;
                         }
                         entry = entry->next;
                     }
+                    if (m_gfxBisectMode > 0 && !d3d12Bindings) {
+                        Log("[GFX-BISECT] app=%s mode=%u requires D3D12; using mode=0\n",
+                            m_applicationName.c_str(), m_gfxBisectMode);
+                        m_gfxBisectMode = 0;
+                    }
+                    if (m_gfxBisectMode > 0) {
+                        // Keep the wrapper alive, but do not expose private images or initialize the processing chain.
+                        m_bisectDevice = graphics::WrapD3D12Device(d3d12Bindings->device,
+                                                                    d3d12Bindings->queue,
+                                                                    m_configManager,
+                                                                    false,
+                                                                    true /* forceDisableInterceptor */);
+                    }
                     m_metroGraphicsSession = *session;
                     Log("[GFX-NEUTRAL] active app=%s session=%p api=%s app_queue=%p "
-                        "toolkit_device_wrapper=0 interceptor=0 frame_analyzer=0 "
-                        "toolkit_command_lists=0 toolkit_fences=0\n",
-                        m_applicationName.c_str(), *session, graphicsApi, appQueue);
+                        "toolkit_device_wrapper=%u interceptor=0 frame_analyzer=0 "
+                        "toolkit_command_lists=%u toolkit_fences=%u\n",
+                        m_applicationName.c_str(), *session, graphicsApi, appQueue,
+                        m_gfxBisectMode > 0, m_gfxBisectMode > 0, m_gfxBisectMode > 0);
+                    Log("[GFX-BISECT] app=%s mode=%u proxy=0 intermediate=0 delayed_release=0 "
+                        "copy=0 interceptor=0 analyzer=0 command_lists=%u fences=%u flush=%s\n",
+                        m_applicationName.c_str(), m_gfxBisectMode, m_gfxBisectMode > 0,
+                        m_gfxBisectMode > 0, m_gfxBisectMode == 2 ? "per_frame" :
+                                                    m_gfxBisectMode == 1 ? "setup_only" : "none");
                     TraceLoggingWrite(g_traceProvider, "xrCreateSession", TLPArg(*session, "Session"));
                     return result;
                 }
@@ -996,7 +1040,8 @@ namespace {
                         // Workaround: On Varjo, we must use intermediate textures with D3D11on12.
                         const bool enableVarjoQuirk = m_runtimeName.find("Varjo") != std::string::npos;
                         m_graphicsDevice = graphics::WrapD3D12Device(
-                            d3dBindings->device, d3dBindings->queue, m_configManager, enableVarjoQuirk);
+                            d3dBindings->device, d3dBindings->queue, m_configManager, enableVarjoQuirk,
+                            isGraphicsNeutralApp() && m_gfxBisectMode == 3);
                         break;
                     }
 
@@ -1222,6 +1267,13 @@ namespace {
 
                     // Remember the XrSession to use.
                     m_vrSession = *session;
+                    if (isGraphicsNeutralApp() && m_gfxBisectMode >= 3) {
+                        Log("[GFX-BISECT] app=%s mode=%u proxy=1 intermediate=conditional "
+                            "delayed_release=1 copy=processing_chain interceptor=%u analyzer=%u "
+                            "command_lists=1 fences=1 flush=normal\n",
+                            m_applicationName.c_str(), m_gfxBisectMode,
+                            m_graphicsDevice->isEventsSupported(), !!m_frameAnalyzer);
+                    }
                 } else {
                     Log("Unsupported graphics runtime.\n");
                 }
@@ -1327,6 +1379,12 @@ namespace {
             const XrResult result = OpenXrApi::xrDestroySession(session);
 
             if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session)) {
+                if (m_bisectDevice) {
+                    // Modes 1/2 own a wrapper but never expose proxy images to the application.
+                    m_bisectDevice->flushContext(true);
+                    m_bisectDevice->shutdown();
+                    m_bisectDevice.reset();
+                }
                 Log("[GFX-NEUTRAL] session destroyed session=%p direct_swapchains=%zu\n",
                     session, m_metroSwapchainIndices.size());
                 m_metroSwapchainIndices.clear();
@@ -2934,10 +2992,14 @@ namespace {
                 }
             }
 
+            if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session) && m_gfxBisectMode == 2) {
+                m_bisectDevice->flushContext();
+            }
             if (isMetroGraphicsSession(session) && m_metroGfxBeginLogs.fetch_add(1) < MetroGfxLogSamples) {
                 Log("[GFX-NEUTRAL] begin result=%s frame_analyzer=0 interceptor=0 "
-                    "toolkit_flushContext=0 toolkit_command_lists=0 toolkit_fences=0\n",
-                    xr::ToCString(result));
+                    "toolkit_flushContext=%u toolkit_command_lists=%u toolkit_fences=%u\n",
+                    xr::ToCString(result), XR_SUCCEEDED(result) && m_gfxBisectMode == 2,
+                    m_gfxBisectMode > 0, m_gfxBisectMode > 0);
             }
 
             return result;
@@ -3204,13 +3266,17 @@ namespace {
                 // The application received the runtime's real images and released them directly to the runtime.
                 // Unlike a proxy swapchain, there is no Toolkit image to copy or translate before submission.
                 const uint32_t sample = m_metroGfxEndLogs.fetch_add(1);
+                if (m_gfxBisectMode == 2) {
+                    m_bisectDevice->flushContext();
+                }
                 if (sample < MetroGfxLogSamples) {
                     Log("[GFX-NEUTRAL] end sample=%u displayTime=%lld layers=%u "
                         "runtime_swapchains=direct app_to_runtime_copy=0 postprocess=0 "
-                        "frame_analyzer=0 interceptor=0 toolkit_flushContext=0 "
-                        "toolkit_command_lists=0 toolkit_fences=0 "
+                        "frame_analyzer=0 interceptor=0 toolkit_flushContext=%u "
+                        "toolkit_command_lists=%u toolkit_fences=%u "
                         "resource_state_before=unobserved resource_state_after=unobserved\n",
-                        sample, static_cast<long long>(frameEndInfo->displayTime), frameEndInfo->layerCount);
+                        sample, static_cast<long long>(frameEndInfo->displayTime), frameEndInfo->layerCount,
+                        m_gfxBisectMode == 2, m_gfxBisectMode > 0, m_gfxBisectMode > 0);
                     for (uint32_t i = 0; frameEndInfo->layers && i < frameEndInfo->layerCount; i++) {
                         if (frameEndInfo->layers[i] &&
                             frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
@@ -3231,7 +3297,8 @@ namespace {
                 const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
                 if (sample < MetroGfxLogSamples) {
                     Log("[GFX-NEUTRAL] end_result sample=%u result=%s submitted_layers=%u "
-                        "extra_copy_or_sync=0\n", sample, xr::ToCString(result), frameEndInfo->layerCount);
+                        "extra_copy_or_sync=%u\n", sample, xr::ToCString(result),
+                        frameEndInfo->layerCount, m_gfxBisectMode == 2);
                 }
                 return result;
             }
@@ -4125,6 +4192,8 @@ namespace {
         std::string m_systemName;
         XrSystemId m_vrSystemId{XR_NULL_SYSTEM_ID};
         XrSession m_vrSession{XR_NULL_HANDLE};
+        uint32_t m_gfxBisectMode{0};
+        std::shared_ptr<graphics::IDevice> m_bisectDevice;
         XrSession m_metroGraphicsSession{XR_NULL_HANDLE};
         std::map<XrSwapchain, uint32_t> m_metroSwapchainIndices;
         std::atomic<uint32_t> m_metroGfxEnumerationLogs{0};

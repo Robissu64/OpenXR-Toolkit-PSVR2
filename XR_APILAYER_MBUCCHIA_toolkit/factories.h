@@ -86,7 +86,8 @@ namespace toolkit {
         std::shared_ptr<IDevice> WrapD3D12Device(ID3D12Device* device,
                                                  ID3D12CommandQueue* queue,
                                                  std::shared_ptr<config::IConfigManager> configManager,
-                                                 bool enableVarjoQuirk = false);
+                                                 bool enableVarjoQuirk = false,
+                                                 bool forceDisableInterceptor = false);
         std::shared_ptr<ITexture> WrapD3D12Texture(std::shared_ptr<IDevice> device,
                                                    const XrSwapchainCreateInfo& info,
                                                    ID3D12Resource* texture,
