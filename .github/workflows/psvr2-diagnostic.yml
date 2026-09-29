@@ -13,6 +13,7 @@ on:
       - fix/native-openxr-app-owned-eye-extension
       - release/v1.1-rc
       - release/v1.1
+      - diag/metro-headtracking
 
 jobs:
   build:
@@ -68,7 +69,10 @@ jobs:
           $out = 'bin/x64/Release'
           $isV11Rc = $env:GITHUB_REF_NAME -eq 'release/v1.1-rc'
           $isV11Final = $env:GITHUB_REF_NAME -eq 'release/v1.1'
-          $release = if ($isV11Final) {
+          $isMetroDiag = $env:GITHUB_REF_NAME -eq 'diag/metro-headtracking'
+          $release = if ($isMetroDiag) {
+            'release-output/OpenXR-Toolkit-PSVR2-MetroHeadtrackingDiag-x64'
+          } elseif ($isV11Final) {
             'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64'
           } elseif ($isV11Rc) {
             'release-output/OpenXR-Toolkit-PSVR2-v1.1-RC-x64'
@@ -99,8 +103,8 @@ jobs:
             Copy-Item -LiteralPath $source -Destination "$release/shaders"
           }
 
-          $readme = if ($isV11Final) { 'docs/PSVR2_V11_README.md' } elseif ($isV11Rc) { 'docs/PSVR2_V11_RC_README.md' } else { 'docs/PSVR2_V1_README.md' }
-          $notes = if ($isV11Final) { 'docs/RELEASE_NOTES_v1.1.md' } elseif ($isV11Rc) { 'docs/RELEASE_NOTES_v1.1_RC.md' } else { 'docs/RELEASE_NOTES_v1.0.md' }
+          $readme = if ($isV11Final -or $isMetroDiag) { 'docs/PSVR2_V11_README.md' } elseif ($isV11Rc) { 'docs/PSVR2_V11_RC_README.md' } else { 'docs/PSVR2_V1_README.md' }
+          $notes = if ($isV11Final -or $isMetroDiag) { 'docs/RELEASE_NOTES_v1.1.md' } elseif ($isV11Rc) { 'docs/RELEASE_NOTES_v1.1_RC.md' } else { 'docs/RELEASE_NOTES_v1.0.md' }
           Copy-Item -LiteralPath $readme -Destination "$release/README.md"
           Copy-Item -LiteralPath $notes -Destination "$release/RELEASE_NOTES.md"
           Copy-Item -LiteralPath 'scripts/Install.bat' -Destination $release
@@ -116,6 +120,6 @@ jobs:
           Get-FileHash 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64/XR_APILAYER_MBUCCHIA_toolkit.dll' -Algorithm SHA256
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_name == 'release/v1.1' && 'OpenXR-Toolkit-PSVR2-v1.1-x64' || github.ref_name == 'release/v1.1-rc' && 'OpenXR-Toolkit-PSVR2-v1.1-RC-x64' || github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
+          name: ${{ github.ref_name == 'diag/metro-headtracking' && 'OpenXR-Toolkit-PSVR2-MetroHeadtrackingDiag-x64' || github.ref_name == 'release/v1.1' && 'OpenXR-Toolkit-PSVR2-v1.1-x64' || github.ref_name == 'release/v1.1-rc' && 'OpenXR-Toolkit-PSVR2-v1.1-RC-x64' || github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
           path: ${{ github.ref_name == 'release/v1.1' && 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64.zip' || 'release-output/OpenXR-Toolkit-PSVR2-*/' }}
           if-no-files-found: error

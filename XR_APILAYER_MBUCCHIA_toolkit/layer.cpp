@@ -3058,6 +3058,13 @@ namespace {
         }
 
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
+            if (m_applicationName == "Impact") {
+                if (!m_metroEndFramePassthroughLogged.exchange(true)) {
+                    Log("[METRO-DIAG] xrEndFrame passthrough active for Impact\n");
+                }
+                return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            }
+
             if (frameEndInfo->type != XR_TYPE_FRAME_END_INFO) {
                 return XR_ERROR_VALIDATION_FAILURE;
             }
@@ -3943,6 +3950,7 @@ namespace {
         }
 
         std::string m_applicationName;
+        std::atomic<bool> m_metroEndFramePassthroughLogged{false};
         bool m_isOpenComposite{false};
         bool m_isUnity{false};
         std::string m_runtimeName;
