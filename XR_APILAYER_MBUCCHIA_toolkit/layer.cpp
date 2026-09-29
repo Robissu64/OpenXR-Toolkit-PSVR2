@@ -833,10 +833,10 @@ namespace {
 
             const XrResult result = OpenXrApi::xrEnumerateViewConfigurationViews(
                 instance, systemId, viewConfigurationType, viewCapacityInput, viewCountOutput, views);
-            if (m_applicationName == "Impact") {
+            if (isGraphicsNeutralApp()) {
                 if (XR_SUCCEEDED(result) && views && m_metroGfxEnumerationLogs.fetch_add(1) < MetroGfxLogSamples) {
                     for (uint32_t eye = 0; eye < *viewCountOutput; eye++) {
-                        Log("[METRO-GFX] recommended eye=%u runtime=%ux%u delivered=%ux%u "
+                        Log("[GFX-NEUTRAL] recommended eye=%u runtime=%ux%u delivered=%ux%u "
                             "resolution_override=0\n", eye, views[eye].recommendedImageRectWidth,
                             views[eye].recommendedImageRectHeight, views[eye].recommendedImageRectWidth,
                             views[eye].recommendedImageRectHeight);
@@ -951,7 +951,7 @@ namespace {
 
             const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
             if (XR_SUCCEEDED(result) && isVrSystem(createInfo->systemId)) {
-                if (m_applicationName == "Impact") {
+                if (isGraphicsNeutralApp()) {
                     const char* graphicsApi = "unknown";
                     const void* appQueue = nullptr;
                     auto entry = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
@@ -968,10 +968,10 @@ namespace {
                         entry = entry->next;
                     }
                     m_metroGraphicsSession = *session;
-                    Log("[METRO-GFX] graphics-neutral active for Impact session=%p api=%s app_queue=%p "
+                    Log("[GFX-NEUTRAL] active app=%s session=%p api=%s app_queue=%p "
                         "toolkit_device_wrapper=0 interceptor=0 frame_analyzer=0 "
                         "toolkit_command_lists=0 toolkit_fences=0\n",
-                        *session, graphicsApi, appQueue);
+                        m_applicationName.c_str(), *session, graphicsApi, appQueue);
                     TraceLoggingWrite(g_traceProvider, "xrCreateSession", TLPArg(*session, "Session"));
                     return result;
                 }
@@ -1327,7 +1327,7 @@ namespace {
             const XrResult result = OpenXrApi::xrDestroySession(session);
 
             if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session)) {
-                Log("[METRO-GFX] session destroyed session=%p direct_swapchains=%zu\n",
+                Log("[GFX-NEUTRAL] session destroyed session=%p direct_swapchains=%zu\n",
                     session, m_metroSwapchainIndices.size());
                 m_metroSwapchainIndices.clear();
                 m_metroGraphicsSession = XR_NULL_HANDLE;
@@ -1399,12 +1399,12 @@ namespace {
                               TLArg(createInfo->usageFlags, "UsageFlags"));
 
             if (isMetroGraphicsSession(session)) {
-                // Every image returned to Impact is owned by the runtime; no private color proxy exists.
+                // Every image returned to this diagnostic application is owned by the runtime.
                 const XrResult result = OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
                 if (XR_SUCCEEDED(result)) {
                     m_metroSwapchainIndices.insert_or_assign(*swapchain, UINT32_MAX);
                 }
-                Log("[METRO-GFX] create swapchain=%p result=%s requested=%ux%u arraySize=%u "
+                Log("[GFX-NEUTRAL] create swapchain=%p result=%s requested=%ux%u arraySize=%u "
                     "format=%lld sampleCount=%u usageFlags=0x%llx runtime=%ux%u "
                     "proxy=0 intermediate=0 additional_usage=0\n",
                     XR_SUCCEEDED(result) ? *swapchain : XR_NULL_HANDLE, xr::ToCString(result),
@@ -1618,7 +1618,7 @@ namespace {
             if (XR_SUCCEEDED(result)) {
                 m_swapchains.erase(swapchain);
                 if (m_metroSwapchainIndices.erase(swapchain)) {
-                    Log("[METRO-GFX] destroy swapchain=%p result=%s\n", swapchain, xr::ToCString(result));
+                    Log("[GFX-NEUTRAL] destroy swapchain=%p result=%s\n", swapchain, xr::ToCString(result));
                 }
             }
 
@@ -1900,7 +1900,7 @@ namespace {
                         firstImage = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images)[0].texture;
                     }
                 }
-                Log("[METRO-GFX] enumerate swapchain=%p count=%u capacity=%u first_runtime_image=%p "
+                Log("[GFX-NEUTRAL] enumerate swapchain=%p count=%u capacity=%u first_runtime_image=%p "
                     "app_image=runtime_image proxy=0 resource_state_before=unobserved "
                     "resource_state_after=unobserved\n",
                     swapchain, *imageCountOutput, imageCapacityInput, firstImage);
@@ -1948,7 +1948,7 @@ namespace {
             if (m_metroSwapchainIndices.count(swapchain)) {
                 const XrResult result = OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);
                 if (m_metroGfxWaitLogs.fetch_add(1) < MetroGfxLogSamples) {
-                    Log("[METRO-GFX] wait swapchain=%p timeout_requested=%lld timeout_forwarded=%lld "
+                    Log("[GFX-NEUTRAL] wait swapchain=%p timeout_requested=%lld timeout_forwarded=%lld "
                         "result=%s toolkit_queue_wait=0 toolkit_fence=0\n",
                         swapchain, static_cast<long long>(waitInfo->timeout),
                         static_cast<long long>(waitInfo->timeout), xr::ToCString(result));
@@ -1978,7 +1978,7 @@ namespace {
                     metroSwapchainIt->second = *index;
                 }
                 if (m_metroGfxAcquireLogs.fetch_add(1) < MetroGfxLogSamples) {
-                    Log("[METRO-GFX] acquire swapchain=%p index=%u result=%s "
+                    Log("[GFX-NEUTRAL] acquire swapchain=%p index=%u result=%s "
                         "frame_analyzer=0 interceptor=0 debug_workload=0\n",
                         swapchain, XR_SUCCEEDED(result) ? *index : UINT32_MAX, xr::ToCString(result));
                 }
@@ -2035,7 +2035,7 @@ namespace {
                     metroSwapchainIt->second = UINT32_MAX;
                 }
                 if (m_metroGfxReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
-                    Log("[METRO-GFX] release swapchain=%p index=%u result=%s "
+                    Log("[GFX-NEUTRAL] release swapchain=%p index=%u result=%s "
                         "delayed=0 app_to_runtime_copy=0 toolkit_flush=0 toolkit_fence=0\n",
                         swapchain, releasedIndex, xr::ToCString(result));
                 }
@@ -2834,7 +2834,7 @@ namespace {
 
             if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session) &&
                 m_metroGfxFrameWaitLogs.fetch_add(1) < MetroGfxLogSamples) {
-                Log("[METRO-GFX] frame_wait predictedDisplayTime=%lld period=%lld "
+                Log("[GFX-NEUTRAL] frame_wait predictedDisplayTime=%lld period=%lld "
                     "toolkit_graphics_queue=0 toolkit_fence=0\n",
                     static_cast<long long>(frameState->predictedDisplayTime),
                     static_cast<long long>(frameState->predictedDisplayPeriod));
@@ -2935,7 +2935,7 @@ namespace {
             }
 
             if (isMetroGraphicsSession(session) && m_metroGfxBeginLogs.fetch_add(1) < MetroGfxLogSamples) {
-                Log("[METRO-GFX] begin result=%s frame_analyzer=0 interceptor=0 "
+                Log("[GFX-NEUTRAL] begin result=%s frame_analyzer=0 interceptor=0 "
                     "toolkit_flushContext=0 toolkit_command_lists=0 toolkit_fences=0\n",
                     xr::ToCString(result));
             }
@@ -3205,7 +3205,7 @@ namespace {
                 // Unlike a proxy swapchain, there is no Toolkit image to copy or translate before submission.
                 const uint32_t sample = m_metroGfxEndLogs.fetch_add(1);
                 if (sample < MetroGfxLogSamples) {
-                    Log("[METRO-GFX] end sample=%u displayTime=%lld layers=%u "
+                    Log("[GFX-NEUTRAL] end sample=%u displayTime=%lld layers=%u "
                         "runtime_swapchains=direct app_to_runtime_copy=0 postprocess=0 "
                         "frame_analyzer=0 interceptor=0 toolkit_flushContext=0 "
                         "toolkit_command_lists=0 toolkit_fences=0 "
@@ -3218,7 +3218,7 @@ namespace {
                                 frameEndInfo->layers[i]);
                             for (uint32_t eye = 0; projection->views && eye < projection->viewCount; eye++) {
                                 const auto& view = projection->views[eye];
-                                Log("[METRO-GFX] submit sample=%u layer=%u eye=%u swapchain=%p "
+                                Log("[GFX-NEUTRAL] submit sample=%u layer=%u eye=%u swapchain=%p "
                                     "imageArrayIndex=%u imageRect=%s runtime_handle=%u\n",
                                     sample, i, eye, view.subImage.swapchain,
                                     view.subImage.imageArrayIndex,
@@ -3230,7 +3230,7 @@ namespace {
                 }
                 const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
                 if (sample < MetroGfxLogSamples) {
-                    Log("[METRO-GFX] end_result sample=%u result=%s submitted_layers=%u "
+                    Log("[GFX-NEUTRAL] end_result sample=%u result=%s submitted_layers=%u "
                         "extra_copy_or_sync=0\n", sample, xr::ToCString(result), frameEndInfo->layerCount);
                 }
                 return result;
@@ -4024,6 +4024,10 @@ namespace {
 
         bool isVrSession(XrSession session) const {
             return session == m_vrSession;
+        }
+
+        bool isGraphicsNeutralApp() const {
+            return m_applicationName == "Impact" || m_applicationName == "TheMidnightWalk";
         }
 
         bool isMetroGraphicsSession(XrSession session) const {
