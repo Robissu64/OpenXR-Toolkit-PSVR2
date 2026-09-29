@@ -40,6 +40,7 @@ namespace {
     // The xrWaitFrame() loop might cause to have 2 frames in-flight, so we want to delay the GPU timer re-use by those
     // 2 frames.
     constexpr uint32_t GpuTimerLatency = 2;
+    constexpr uint32_t MetroGfxLogSamples = 8;
 
     // Keep this transformation identical to the simple-FOV path in xrLocateViews().
     XrFovf ScaleSimpleFov(XrFovf fov, int percent) {
@@ -832,6 +833,17 @@ namespace {
 
             const XrResult result = OpenXrApi::xrEnumerateViewConfigurationViews(
                 instance, systemId, viewConfigurationType, viewCapacityInput, viewCountOutput, views);
+            if (m_applicationName == "Impact") {
+                if (XR_SUCCEEDED(result) && views && m_metroGfxEnumerationLogs.fetch_add(1) < MetroGfxLogSamples) {
+                    for (uint32_t eye = 0; eye < *viewCountOutput; eye++) {
+                        Log("[METRO-GFX] recommended eye=%u runtime=%ux%u delivered=%ux%u "
+                            "resolution_override=0\n", eye, views[eye].recommendedImageRectWidth,
+                            views[eye].recommendedImageRectHeight, views[eye].recommendedImageRectWidth,
+                            views[eye].recommendedImageRectHeight);
+                    }
+                }
+                return result;
+            }
             if (XR_SUCCEEDED(result) && m_cropActive &&
                 viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
                 return result;
@@ -939,6 +951,30 @@ namespace {
 
             const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
             if (XR_SUCCEEDED(result) && isVrSystem(createInfo->systemId)) {
+                if (m_applicationName == "Impact") {
+                    const char* graphicsApi = "unknown";
+                    const void* appQueue = nullptr;
+                    auto entry = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
+                    while (entry) {
+                        if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
+                            graphicsApi = "D3D11";
+                            break;
+                        }
+                        if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
+                            graphicsApi = "D3D12";
+                            appQueue = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(entry)->queue;
+                            break;
+                        }
+                        entry = entry->next;
+                    }
+                    m_metroGraphicsSession = *session;
+                    Log("[METRO-GFX] graphics-neutral active for Impact session=%p api=%s app_queue=%p "
+                        "toolkit_device_wrapper=0 interceptor=0 frame_analyzer=0 "
+                        "toolkit_command_lists=0 toolkit_fences=0\n",
+                        *session, graphicsApi, appQueue);
+                    TraceLoggingWrite(g_traceProvider, "xrCreateSession", TLPArg(*session, "Session"));
+                    return result;
+                }
                 // Get the graphics device.
                 const XrBaseInStructure* entry = reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
                 while (entry) {
@@ -1290,6 +1326,13 @@ namespace {
 
             const XrResult result = OpenXrApi::xrDestroySession(session);
 
+            if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session)) {
+                Log("[METRO-GFX] session destroyed session=%p direct_swapchains=%zu\n",
+                    session, m_metroSwapchainIndices.size());
+                m_metroSwapchainIndices.clear();
+                m_metroGraphicsSession = XR_NULL_HANDLE;
+            }
+
             if (XR_SUCCEEDED(result) && isVrSession(session)) {
                 // Cleanup our resources.
                 m_upscaler.reset();
@@ -1354,6 +1397,23 @@ namespace {
                               TLArg(createInfo->mipCount, "MipCount"),
                               TLArg(createInfo->sampleCount, "SampleCount"),
                               TLArg(createInfo->usageFlags, "UsageFlags"));
+
+            if (isMetroGraphicsSession(session)) {
+                // Every image returned to Impact is owned by the runtime; no private color proxy exists.
+                const XrResult result = OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
+                if (XR_SUCCEEDED(result)) {
+                    m_metroSwapchainIndices.insert_or_assign(*swapchain, UINT32_MAX);
+                }
+                Log("[METRO-GFX] create swapchain=%p result=%s requested=%ux%u arraySize=%u "
+                    "format=%lld sampleCount=%u usageFlags=0x%llx runtime=%ux%u "
+                    "proxy=0 intermediate=0 additional_usage=0\n",
+                    XR_SUCCEEDED(result) ? *swapchain : XR_NULL_HANDLE, xr::ToCString(result),
+                    createInfo->width, createInfo->height, createInfo->arraySize,
+                    static_cast<long long>(createInfo->format), createInfo->sampleCount,
+                    static_cast<unsigned long long>(createInfo->usageFlags),
+                    createInfo->width, createInfo->height);
+                return result;
+            }
 
             if (!isVrSession(session) || !m_graphicsDevice) {
                 return OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
@@ -1557,6 +1617,9 @@ namespace {
             const XrResult result = OpenXrApi::xrDestroySwapchain(swapchain);
             if (XR_SUCCEEDED(result)) {
                 m_swapchains.erase(swapchain);
+                if (m_metroSwapchainIndices.erase(swapchain)) {
+                    Log("[METRO-GFX] destroy swapchain=%p result=%s\n", swapchain, xr::ToCString(result));
+                }
             }
 
             return result;
@@ -1827,6 +1890,21 @@ namespace {
 
             const XrResult result =
                 OpenXrApi::xrEnumerateSwapchainImages(swapchain, imageCapacityInput, imageCountOutput, images);
+            if (m_metroSwapchainIndices.count(swapchain) && XR_SUCCEEDED(result) &&
+                m_metroGfxImageLogs.fetch_add(1) < MetroGfxLogSamples) {
+                void* firstImage = nullptr;
+                if (images && *imageCountOutput) {
+                    if (images[0].type == XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) {
+                        firstImage = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images)[0].texture;
+                    } else if (images[0].type == XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) {
+                        firstImage = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images)[0].texture;
+                    }
+                }
+                Log("[METRO-GFX] enumerate swapchain=%p count=%u capacity=%u first_runtime_image=%p "
+                    "app_image=runtime_image proxy=0 resource_state_before=unobserved "
+                    "resource_state_after=unobserved\n",
+                    swapchain, *imageCountOutput, imageCapacityInput, firstImage);
+            }
             if (XR_SUCCEEDED(result) && images) {
                 auto swapchainIt = m_swapchains.find(swapchain);
                 if (swapchainIt != m_swapchains.end()) {
@@ -1867,6 +1945,17 @@ namespace {
             TraceLoggingWrite(
                 g_traceProvider, "xrWaitSwapchainImage", TLPArg(swapchain, "Swapchain"), TLArg(waitInfo->timeout));
 
+            if (m_metroSwapchainIndices.count(swapchain)) {
+                const XrResult result = OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);
+                if (m_metroGfxWaitLogs.fetch_add(1) < MetroGfxLogSamples) {
+                    Log("[METRO-GFX] wait swapchain=%p timeout_requested=%lld timeout_forwarded=%lld "
+                        "result=%s toolkit_queue_wait=0 toolkit_fence=0\n",
+                        swapchain, static_cast<long long>(waitInfo->timeout),
+                        static_cast<long long>(waitInfo->timeout), xr::ToCString(result));
+                }
+                return result;
+            }
+
             // We remove the timeout causing issues with OpenComposite.
             XrSwapchainImageWaitInfo chainWaitInfo = *waitInfo;
             chainWaitInfo.timeout = XR_INFINITE_DURATION;
@@ -1881,6 +1970,20 @@ namespace {
             }
 
             TraceLoggingWrite(g_traceProvider, "xrAcquireSwapchainImage", TLPArg(swapchain, "Swapchain"));
+
+            auto metroSwapchainIt = m_metroSwapchainIndices.find(swapchain);
+            if (metroSwapchainIt != m_metroSwapchainIndices.end()) {
+                const XrResult result = OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
+                if (XR_SUCCEEDED(result)) {
+                    metroSwapchainIt->second = *index;
+                }
+                if (m_metroGfxAcquireLogs.fetch_add(1) < MetroGfxLogSamples) {
+                    Log("[METRO-GFX] acquire swapchain=%p index=%u result=%s "
+                        "frame_analyzer=0 interceptor=0 debug_workload=0\n",
+                        swapchain, XR_SUCCEEDED(result) ? *index : UINT32_MAX, xr::ToCString(result));
+                }
+                return result;
+            }
 
             auto swapchainIt = m_swapchains.find(swapchain);
             if (swapchainIt != m_swapchains.end()) {
@@ -1923,6 +2026,21 @@ namespace {
             }
 
             TraceLoggingWrite(g_traceProvider, "xrReleaseSwapchainImage", TLPArg(swapchain, "Swapchain"));
+
+            auto metroSwapchainIt = m_metroSwapchainIndices.find(swapchain);
+            if (metroSwapchainIt != m_metroSwapchainIndices.end()) {
+                const uint32_t releasedIndex = metroSwapchainIt->second;
+                const XrResult result = OpenXrApi::xrReleaseSwapchainImage(swapchain, releaseInfo);
+                if (XR_SUCCEEDED(result)) {
+                    metroSwapchainIt->second = UINT32_MAX;
+                }
+                if (m_metroGfxReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
+                    Log("[METRO-GFX] release swapchain=%p index=%u result=%s "
+                        "delayed=0 app_to_runtime_copy=0 toolkit_flush=0 toolkit_fence=0\n",
+                        swapchain, releasedIndex, xr::ToCString(result));
+                }
+                return result;
+            }
 
             auto swapchainIt = m_swapchains.find(swapchain);
             if (swapchainIt != m_swapchains.end()) {
@@ -2714,6 +2832,14 @@ namespace {
                                   TLArg(frameState->predictedDisplayPeriod, "PredictedDisplayPeriod"));
             }
 
+            if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session) &&
+                m_metroGfxFrameWaitLogs.fetch_add(1) < MetroGfxLogSamples) {
+                Log("[METRO-GFX] frame_wait predictedDisplayTime=%lld period=%lld "
+                    "toolkit_graphics_queue=0 toolkit_fence=0\n",
+                    static_cast<long long>(frameState->predictedDisplayTime),
+                    static_cast<long long>(frameState->predictedDisplayPeriod));
+            }
+
             return result;
         }
 
@@ -2806,6 +2932,12 @@ namespace {
                 if (m_variableRateShader) {
                     m_variableRateShader->beginFrame(m_begunFrameTime);
                 }
+            }
+
+            if (isMetroGraphicsSession(session) && m_metroGfxBeginLogs.fetch_add(1) < MetroGfxLogSamples) {
+                Log("[METRO-GFX] begin result=%s frame_analyzer=0 interceptor=0 "
+                    "toolkit_flushContext=0 toolkit_command_lists=0 toolkit_fences=0\n",
+                    xr::ToCString(result));
             }
 
             return result;
@@ -3067,6 +3199,42 @@ namespace {
                               TLPArg(session, "Session"),
                               TLArg(frameEndInfo->displayTime, "DisplayTime"),
                               TLArg(xr::ToCString(frameEndInfo->environmentBlendMode), "EnvironmentBlendMode"));
+
+            if (isMetroGraphicsSession(session)) {
+                // The application received the runtime's real images and released them directly to the runtime.
+                // Unlike a proxy swapchain, there is no Toolkit image to copy or translate before submission.
+                const uint32_t sample = m_metroGfxEndLogs.fetch_add(1);
+                if (sample < MetroGfxLogSamples) {
+                    Log("[METRO-GFX] end sample=%u displayTime=%lld layers=%u "
+                        "runtime_swapchains=direct app_to_runtime_copy=0 postprocess=0 "
+                        "frame_analyzer=0 interceptor=0 toolkit_flushContext=0 "
+                        "toolkit_command_lists=0 toolkit_fences=0 "
+                        "resource_state_before=unobserved resource_state_after=unobserved\n",
+                        sample, static_cast<long long>(frameEndInfo->displayTime), frameEndInfo->layerCount);
+                    for (uint32_t i = 0; frameEndInfo->layers && i < frameEndInfo->layerCount; i++) {
+                        if (frameEndInfo->layers[i] &&
+                            frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                            const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(
+                                frameEndInfo->layers[i]);
+                            for (uint32_t eye = 0; projection->views && eye < projection->viewCount; eye++) {
+                                const auto& view = projection->views[eye];
+                                Log("[METRO-GFX] submit sample=%u layer=%u eye=%u swapchain=%p "
+                                    "imageArrayIndex=%u imageRect=%s runtime_handle=%u\n",
+                                    sample, i, eye, view.subImage.swapchain,
+                                    view.subImage.imageArrayIndex,
+                                    xr::ToString(view.subImage.imageRect).c_str(),
+                                    m_metroSwapchainIndices.count(view.subImage.swapchain) != 0);
+                            }
+                        }
+                    }
+                }
+                const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
+                if (sample < MetroGfxLogSamples) {
+                    Log("[METRO-GFX] end_result sample=%u result=%s submitted_layers=%u "
+                        "extra_copy_or_sync=0\n", sample, xr::ToCString(result), frameEndInfo->layerCount);
+                }
+                return result;
+            }
 
             if (!isVrSession(session) || !m_graphicsDevice) {
                 return OpenXrApi::xrEndFrame(session, frameEndInfo);
@@ -3858,6 +4026,10 @@ namespace {
             return session == m_vrSession;
         }
 
+        bool isMetroGraphicsSession(XrSession session) const {
+            return m_metroGraphicsSession != XR_NULL_HANDLE && session == m_metroGraphicsSession;
+        }
+
         const std::string getPath(XrPath path) {
             if (path == XR_NULL_PATH) {
                 return "";
@@ -3949,6 +4121,16 @@ namespace {
         std::string m_systemName;
         XrSystemId m_vrSystemId{XR_NULL_SYSTEM_ID};
         XrSession m_vrSession{XR_NULL_HANDLE};
+        XrSession m_metroGraphicsSession{XR_NULL_HANDLE};
+        std::map<XrSwapchain, uint32_t> m_metroSwapchainIndices;
+        std::atomic<uint32_t> m_metroGfxEnumerationLogs{0};
+        std::atomic<uint32_t> m_metroGfxImageLogs{0};
+        std::atomic<uint32_t> m_metroGfxWaitLogs{0};
+        std::atomic<uint32_t> m_metroGfxAcquireLogs{0};
+        std::atomic<uint32_t> m_metroGfxReleaseLogs{0};
+        std::atomic<uint32_t> m_metroGfxFrameWaitLogs{0};
+        std::atomic<uint32_t> m_metroGfxBeginLogs{0};
+        std::atomic<uint32_t> m_metroGfxEndLogs{0};
         uint32_t m_displayWidth{0};
         uint32_t m_displayHeight{0};
         uint32_t m_runtimeRecommendedWidth[utilities::ViewCount]{};
