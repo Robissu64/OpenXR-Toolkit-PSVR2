@@ -1,0 +1,160 @@
+OpenXR Toolkit PSVR2 - Proxy Copy Sync Diagnostic
+================================================
+Branch: diag/proxy-copy-sync-bisect
+Base: 15533b8e8e79d63daa4894282d75aef75b1e3fc7
+Artifact: OpenXR-Toolkit-PSVR2-ProxySyncDiag-x64
+This is a diagnostic build, NOT a permanent fix or the public v1.1 release.
+release/v1.1 must remain at 3a6b1084b9761f57e5b18e425753c87d4809023d.
+
+Scope and controls
+------------------
+Only OpenXR application names Impact and TheMidnightWalk select this diagnostic.
+OXRTK_PROXY_SYNC_TEST is read at process startup: 0, 1 or 2.
+Missing/invalid values select Mode 0. OXRTK_GFX_BISECT and OXRTK_GFX_SUBBISECT
+are ignored for these two application names. Other applications do not enable
+the new device synchronization code. D3D12 is required.
+
+All three modes use the same Submode 2 path: runtime-owned XrSwapchain handle,
+private color textures returned during image enumeration, matching app/runtime
+image indices and dimensions, raw CopyResource during app release, depth direct,
+and immediate downstream release. The original !isDepth proxy predicate is
+unchanged; in the tested games this includes the projection color swapchain.
+There is no new processing, overlay, interceptor, Frame Analyzer or delayed
+release path. Keep Safe Mode and all game/Toolkit settings identical between
+runs. Use FFR/DFR Off, Crop Off and the same FOV for this experiment.
+
+Modes and exact ordering
+------------------------
+0 - Unstable control: original flushContext path. Close current list, execute,
+    rotate ring and reset the next allocator/list without a completion check,
+    then downstream release. No additional fence Signal or wait. Observational
+    logging does not change the GPU commands or synchronization policy.
+1 - Allocator lifetime safety: one fence value per slot, covering EVERY list
+    submission (including the unchanged begin/end-frame flush calls). Check the
+    NEXT slot's previous fence, wait only if needed, reset that allocator/list,
+    then execute the CURRENT list and signal a monotonically increasing value
+    on the same graphics-binding queue. Associate that value with the submitted
+    slot and release immediately. Do NOT wait for the current submission.
+2 - Same allocator safety as Mode 1. After executing the color copy, the SAME
+    fence Signal used for that slot also identifies copy completion. Check/wait
+    for that current value, verify completed >= current, then downstream release.
+    Empty begin/end-frame submissions do not wait for their current completion.
+
+Why prepare the next slot before ExecuteCommandLists?
+The old flush resets the next slot AFTER submission. Adding a reuse wait there
+would delay the current image's release and confound Mode 1 with Mode 2. Modes
+1/2 therefore prepare the next slot BEFORE the current list is submitted. The
+ring still has exactly 32 slots, the same number of lists are executed, and no
+allocator-reset wait is allowed between the current Execute and release.
+The current slot's reset observations come from its preceding preparation;
+prepared_next_slot observations describe the reset done in this flush.
+Shutdown's existing blocking flush is retained outside the frame experiment.
+
+Installation and launch
+-----------------------
+Download the artifact from the successful Actions run matching BUILD_COMMIT.txt.
+Extract the ENTIRE artifact to a permanent directory and install with Install.bat.
+Verify that the active registered layer points to this directory and that Safe
+Mode has not disabled the diagnostic. No release/v1.1 package is overwritten.
+
+Before EACH mode: fully exit the game, SteamVR and Steam (including tray Steam).
+Use a fresh PowerShell window or set the variable again. Launch Steam from that
+window so it inherits the variable. A running Steam process may ignore the new
+environment. If launch modes are offered, select VR. Keep the same scene and
+record stable/wobble/black for each mode. Run all three modes in separate game
+processes; Mode 0 is expected to wobble. Retain each log before the next run.
+
+The Midnight Walk - Mode 0 (Steam 2863640)
+-----------------------------------------
+$env:OXRTK_PROXY_SYNC_TEST = '0'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+
+The Midnight Walk - Mode 1
+--------------------------
+$env:OXRTK_PROXY_SYNC_TEST = '1'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+
+The Midnight Walk - Mode 2
+--------------------------
+$env:OXRTK_PROXY_SYNC_TEST = '2'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2863640'
+
+Metro Awakening / Impact - Mode 0 (Steam 2669410)
+------------------------------------------------
+$env:OXRTK_PROXY_SYNC_TEST = '0'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+
+Metro Awakening / Impact - Mode 1
+--------------------------------
+$env:OXRTK_PROXY_SYNC_TEST = '1'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+
+Metro Awakening / Impact - Mode 2
+--------------------------------
+$env:OXRTK_PROXY_SYNC_TEST = '2'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+
+Save a log AFTER exiting the game, BEFORE launching the next mode
+---------------------------------------------------------------
+$mode = $env:OXRTK_PROXY_SYNC_TEST
+$log = Join-Path $env:LOCALAPPDATA 'OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log'
+$savedLog = Join-Path ([Environment]::GetFolderPath('Desktop')) "ProxySync-Mode$mode.log"
+Copy-Item -LiteralPath $log -Destination $savedLog
+Select-String -LiteralPath $savedLog -Pattern '\[PROXY-SYNC\]'
+
+Logging and checks
+------------------
+[PROXY-SYNC] startup must show the intended app and mode. Color/depth release
+logs are limited to 128 release calls per session; Mode 1/2 non-copy flush logs
+are independently limited to 128. Run long enough to observe ring wraparound.
+Copy/release logs are written AFTER downstream release, in every mode.
+
+Check queue and binding_queue pointers with queues_match=1. current_fence is
+the submitted slot's new fence value. previous_fence/completed_before_reuse/
+reuse_wait describe when that submitted slot was prepared earlier. next_* fields
+describe preparation performed BEFORE this submission; next_reset_before_execute
+must be 1 in Modes 1/2. Non-copy flush logs expose waits outside color release.
+
+Mode 0: fence_tracking=0, current_fence=0 and copy_wait=0. Zero previous values
+mean UNTRACKED, not proof that the legacy allocator had completed. Mode 1:
+fence_tracking=1 and completion_required=0, copy_wait=0 even if GPU is behind.
+Mode 2: completion_required=1, completed_before_release >= current_fence.
+copy_wait may be 0 if the current fence had already completed; that is valid.
+Depth release has copy=0 and no slot submission or current-copy wait.
+
+Resource states are wrapper-tracked states, NOT independently measured GPU
+states. Logs include before/after source and destination, COPY_SOURCE/COPY_DEST
+and the number of transition barriers recorded (including restoration). Normal
+color returns to RENDER_TARGET, depth remains DEPTH_WRITE. The proxy resource
+and runtime resource should differ for color and match for depth; indices match.
+
+Interpretation
+--------------
+0 unstable / 1 stable: strong evidence for allocator/list lifetime/reuse.
+0 unstable / 1 unstable / 2 stable: strong evidence for current-copy completion
+before release as the decisive difference after allocator safety is established.
+0/1/2 unstable: these synchronization changes alone do not explain the wobble;
+next investigate proxy semantics, resource states, color/depth temporal pairing
+or image lifecycle. A stable Mode 0 invalidates this run's unstable control.
+
+Do not treat XR_ERROR_CALL_ORDER_INVALID or XR_FRAME_DISCARDED alone as the
+cause: both previously appeared in stable and unstable captures. A successful
+Actions build is not a hardware validation. A Mode 2 improvement is not proof
+that CPU waits are required by the OpenXR contract or an appropriate final fix.
+
+Local logic validation (repository checkout; Python + Git + g++)
+---------------------------------------------------------------
+python tests/proxy_sync_ring.py
+
+The test compiles the actual production flush/fence methods against a stalled
+mock GPU, runs 240 submissions per mode across multiple ring wraps, compares
+Mode 0's command/reset ordering with the validated base commit, checks that
+Mode 1 never waits for its current submission after Execute, and checks Mode 2
+completion plus Signal/wait/device-removal failures. This is not a Windows/D3D12
+build or a headset test. GitHub Actions performs the real Windows build.

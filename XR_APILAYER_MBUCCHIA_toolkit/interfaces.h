@@ -472,6 +472,9 @@ namespace toolkit {
             virtual void setState(D3D12_RESOURCE_STATES newState) = 0;
             virtual void pushState(D3D12_RESOURCE_STATES newState) = 0;
             virtual void popState() = 0;
+            virtual D3D12_RESOURCE_STATES getTrackedStateForDiagnostics() const {
+                return D3D12_RESOURCE_STATE_COMMON;
+            }
 
             virtual void* getNativePtr() const = 0;
 
@@ -542,6 +545,31 @@ namespace toolkit {
             }
         };
 
+        // Diagnostic-only D3D12 submission observations. No synchronization is enabled by default.
+        struct ProxySyncReuse {
+            uint32_t slot{0};
+            void* allocator{nullptr};
+            void* commandList{nullptr};
+            uint64_t previousFence{0};
+            uint64_t completedBeforeReuse{0};
+            bool waited{false};
+            double waitMs{0};
+        };
+
+        struct ProxySyncSubmission {
+            ProxySyncReuse submittedSlot;
+            ProxySyncReuse preparedNextSlot;
+            void* queue{nullptr};
+            void* bindingQueue{nullptr};
+            void* fence{nullptr};
+            uint64_t submissionFence{0};
+            uint64_t completedBeforeCopyWait{0};
+            uint64_t completedAfterCopyWait{0};
+            uint64_t completedBeforeRelease{0};
+            bool copyWaited{false};
+            double copyWaitMs{0};
+        };
+
         // A graphics device.
         struct IDevice {
             virtual ~IDevice() = default;
@@ -557,6 +585,12 @@ namespace toolkit {
             virtual void saveContext(bool clear = true) = 0;
             virtual void restoreContext() = 0;
             virtual void flushContext(bool blocking = false, bool isEndOfFrame = false) = 0;
+
+            virtual void configureProxySyncDiagnostic(uint32_t, void*) {}
+            virtual ProxySyncSubmission flushProxySyncCopy() {
+                flushContext();
+                return {};
+            }
 
             virtual std::shared_ptr<ITexture> createTexture(const XrSwapchainCreateInfo& info,
                                                             std::string_view debugName,

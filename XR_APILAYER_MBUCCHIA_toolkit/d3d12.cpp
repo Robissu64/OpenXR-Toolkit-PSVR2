@@ -585,6 +585,10 @@ namespace {
             m_currentState = newState;
         }
 
+        D3D12_RESOURCE_STATES getTrackedStateForDiagnostics() const override {
+            return m_currentState;
+        }
+
         void* getNativePtr() const override {
             return get(m_texture);
         }
@@ -1153,6 +1157,22 @@ namespace {
         }
 
         void flushContext(bool blocking, bool isEndOfFrame = false) override {
+            if (m_proxySyncEnabled && m_proxySyncMode > 0) {
+                flushProxySyncContext(blocking, isEndOfFrame);
+                return;
+            }
+            // Mode 0 deliberately retains the original submission/reset path, including no new Signal.
+            if (m_proxySyncEnabled) {
+                m_proxySyncSubmission = {};
+                m_proxySyncSubmission.submittedSlot.slot = static_cast<uint32_t>(m_currentContext);
+                m_proxySyncSubmission.submittedSlot.allocator = get(m_commandAllocator[m_currentContext]);
+                m_proxySyncSubmission.submittedSlot.commandList = get(m_context);
+                m_proxySyncSubmission.submittedSlot.completedBeforeReuse =
+                    m_proxySyncLegacyCompletedBeforeReset[m_currentContext];
+                m_proxySyncSubmission.queue = get(m_queue);
+                m_proxySyncSubmission.bindingQueue = m_proxySyncBindingQueue;
+                m_proxySyncSubmission.fence = get(m_fence);
+            }
             if (isEndOfFrame) {
                 // Resolve the timers.
                 m_context->ResolveQueryData(get(m_queryHeap),
@@ -1181,9 +1201,49 @@ namespace {
             if (++m_currentContext == NumInflightContexts) {
                 m_currentContext = 0;
             }
+            if (m_proxySyncEnabled) {
+                m_proxySyncLegacyCompletedBeforeReset[m_currentContext] = m_fence->GetCompletedValue();
+                m_proxySyncSubmission.preparedNextSlot.slot = static_cast<uint32_t>(m_currentContext);
+                m_proxySyncSubmission.preparedNextSlot.allocator = get(m_commandAllocator[m_currentContext]);
+                m_proxySyncSubmission.preparedNextSlot.commandList = get(m_commandList[m_currentContext]);
+                m_proxySyncSubmission.preparedNextSlot.completedBeforeReuse =
+                    m_proxySyncLegacyCompletedBeforeReset[m_currentContext];
+            }
             CHECK_HRCMD(m_commandAllocator[m_currentContext]->Reset());
             CHECK_HRCMD(m_commandList[m_currentContext]->Reset(get(m_commandAllocator[m_currentContext]), nullptr));
             m_context = m_commandList[m_currentContext];
+        }
+
+        void configureProxySyncDiagnostic(uint32_t mode, void* bindingQueue) override {
+            if (mode > 2) {
+                throw std::runtime_error("Invalid proxy sync diagnostic mode");
+            }
+            m_proxySyncEnabled = true;
+            m_proxySyncMode = mode;
+            m_proxySyncBindingQueue = bindingQueue;
+            for (uint32_t slot = 0; slot < NumInflightContexts; ++slot) {
+                m_proxySyncReuse[slot].slot = slot;
+                m_proxySyncReuse[slot].allocator = get(m_commandAllocator[slot]);
+                m_proxySyncReuse[slot].commandList = get(m_commandList[slot]);
+            }
+        }
+
+        ProxySyncSubmission flushProxySyncCopy() override {
+            m_proxySyncCopySubmission = true;
+            try {
+                flushContext(false);
+            } catch (...) {
+                m_proxySyncCopySubmission = false;
+                throw;
+            }
+            m_proxySyncCopySubmission = false;
+            m_proxySyncSubmission.completedBeforeRelease = proxySyncCompletedValue();
+            if (m_proxySyncMode == 0) {
+                // No diagnostic Signal was performed in the legacy control.
+                m_proxySyncSubmission.completedBeforeCopyWait = m_proxySyncSubmission.completedBeforeRelease;
+                m_proxySyncSubmission.completedAfterCopyWait = m_proxySyncSubmission.completedBeforeRelease;
+            }
+            return m_proxySyncSubmission;
         }
 
         std::shared_ptr<ITexture> createTexture(const XrSwapchainCreateInfo& info,
@@ -1983,6 +2043,110 @@ namespace {
         }
 
       private:
+        uint64_t proxySyncCompletedValue() const {
+            const uint64_t completed = m_fence->GetCompletedValue();
+            if (completed == UINT64_MAX) {
+                CHECK_HRCMD(m_device->GetDeviceRemovedReason());
+                throw std::runtime_error("Proxy sync fence reported device removal");
+            }
+            return completed;
+        }
+
+        double waitProxySyncFence(uint64_t value) const {
+            const auto start = std::chrono::steady_clock::now();
+            wil::unique_handle eventHandle;
+            *eventHandle.put() = CreateEventEx(nullptr, L"ProxySync Fence", 0, EVENT_ALL_ACCESS);
+            if (!eventHandle) {
+                CHECK_HRCMD(HRESULT_FROM_WIN32(GetLastError()));
+                throw std::runtime_error("Could not create proxy sync fence event");
+            }
+            CHECK_HRCMD(m_fence->SetEventOnCompletion(value, eventHandle.get()));
+            const DWORD result = WaitForSingleObject(eventHandle.get(), INFINITE);
+            if (result != WAIT_OBJECT_0) {
+                if (result == WAIT_FAILED) {
+                    CHECK_HRCMD(HRESULT_FROM_WIN32(GetLastError()));
+                }
+                throw std::runtime_error("Proxy sync fence wait failed");
+            }
+            if (proxySyncCompletedValue() < value) {
+                throw std::runtime_error("Proxy sync fence wait did not complete submission");
+            }
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
+
+        void flushProxySyncContext(bool blocking, bool isEndOfFrame) {
+            const size_t submittedSlot = m_currentContext;
+            const size_t nextSlot = (submittedSlot + 1) % NumInflightContexts;
+            ProxySyncSubmission observation;
+            observation.submittedSlot = m_proxySyncReuse[submittedSlot];
+            observation.queue = get(m_queue);
+            observation.bindingQueue = m_proxySyncBindingQueue;
+            observation.fence = get(m_fence);
+
+            if (isEndOfFrame) {
+                m_context->ResolveQueryData(get(m_queryHeap), D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                            m_nextGpuTimestampIndex, get(m_queryReadbackBuffer), 0);
+            }
+            CHECK_HRCMD(m_context->Close());
+
+            // Prepare the NEXT slot before submitting the CURRENT list. A reuse wait must never
+            // be inserted between the current copy's ExecuteCommandLists and downstream release.
+            ProxySyncReuse reuse;
+            reuse.slot = static_cast<uint32_t>(nextSlot);
+            reuse.allocator = get(m_commandAllocator[nextSlot]);
+            reuse.commandList = get(m_commandList[nextSlot]);
+            reuse.previousFence = m_proxySyncSlotFence[nextSlot];
+            reuse.completedBeforeReuse = proxySyncCompletedValue();
+            if (reuse.completedBeforeReuse < reuse.previousFence) {
+                reuse.waited = true;
+                reuse.waitMs = waitProxySyncFence(reuse.previousFence);
+            }
+            CHECK_HRCMD(m_commandAllocator[nextSlot]->Reset());
+            CHECK_HRCMD(m_commandList[nextSlot]->Reset(get(m_commandAllocator[nextSlot]), nullptr));
+            m_proxySyncReuse[nextSlot] = reuse;
+            observation.preparedNextSlot = reuse;
+
+            ID3D12CommandList* const lists[] = {get(m_context)};
+            m_queue->ExecuteCommandLists(ARRAYSIZE(lists), lists);
+            // One monotonically increasing fence on the graphics-binding queue covers EVERY
+            // ring submission, including the original begin/end-frame nonblocking flushes.
+            observation.submissionFence = ++m_fenceValue;
+            CHECK_HRCMD(m_queue->Signal(get(m_fence), observation.submissionFence));
+            m_proxySyncSlotFence[submittedSlot] = observation.submissionFence;
+            observation.completedBeforeCopyWait = proxySyncCompletedValue();
+            if (blocking || (m_proxySyncCopySubmission && m_proxySyncMode == 2)) {
+                if (observation.completedBeforeCopyWait < observation.submissionFence) {
+                    observation.copyWaited = true;
+                    observation.copyWaitMs = waitProxySyncFence(observation.submissionFence);
+                }
+            }
+            observation.completedAfterCopyWait = proxySyncCompletedValue();
+            if ((blocking || (m_proxySyncCopySubmission && m_proxySyncMode == 2)) &&
+                observation.completedAfterCopyWait < observation.submissionFence) {
+                throw std::runtime_error("Proxy sync completion was not verified");
+            }
+            m_currentContext = nextSlot;
+            m_context = m_commandList[nextSlot];
+            m_proxySyncSubmission = observation;
+
+            // Copy observations are printed by the layer AFTER downstream release, identically
+            // in all three modes. Log other flushes to expose reuse waits outside color release.
+            if (!m_proxySyncCopySubmission && m_proxySyncFlushLogs++ < 128) {
+                Log("[PROXY-SYNC] mode=%u kind=non_copy_flush slot=%u allocator=%p list=%p "
+                    "queue=%p binding_queue=%p queues_match=%u fence=%p current_fence=%llu "
+                    "reset_slot=%u reset_allocator=%p reset_list=%p previous_fence=%llu "
+                    "completed_before_reuse=%llu reuse_wait=%u reuse_wait_ms=%.3f "
+                    "order=reuse_check_then_reset_then_execute_then_signal blocking=%u\n",
+                    m_proxySyncMode, observation.submittedSlot.slot, observation.submittedSlot.allocator,
+                    observation.submittedSlot.commandList, observation.queue, observation.bindingQueue,
+                    observation.queue == observation.bindingQueue, observation.fence,
+                    static_cast<unsigned long long>(observation.submissionFence), reuse.slot, reuse.allocator,
+                    reuse.commandList, static_cast<unsigned long long>(reuse.previousFence),
+                    static_cast<unsigned long long>(reuse.completedBeforeReuse), reuse.waited, reuse.waitMs,
+                    blocking);
+            }
+        }
+
         void initializeInterceptor() {
             if (!m_allowInterceptor) {
                 return;
@@ -2313,6 +2477,15 @@ namespace {
         ComPtr<ID3D12PipelineState> m_meshRendererNoCullingPipelineState;
         ComPtr<ID3D12Fence> m_fence;
         UINT64 m_fenceValue{0};
+        bool m_proxySyncEnabled{false};
+        uint32_t m_proxySyncMode{0};
+        void* m_proxySyncBindingQueue{nullptr};
+        bool m_proxySyncCopySubmission{false};
+        uint64_t m_proxySyncSlotFence[NumInflightContexts]{};
+        uint64_t m_proxySyncLegacyCompletedBeforeReset[NumInflightContexts]{};
+        ProxySyncReuse m_proxySyncReuse[NumInflightContexts]{};
+        ProxySyncSubmission m_proxySyncSubmission;
+        uint32_t m_proxySyncFlushLogs{0};
 
         UINT m_nextGpuTimestampIndex{0};
         uint64_t m_queryBuffer[MaxGpuTimers * 2];

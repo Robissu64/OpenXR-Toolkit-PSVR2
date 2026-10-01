@@ -363,15 +363,18 @@ namespace {
             m_applicationName = createInfo->applicationInfo.applicationName;
             if (isGraphicsNeutralApp()) {
                 char modeText[8]{};
-                const DWORD modeLength = GetEnvironmentVariableA("OXRTK_GFX_SUBBISECT", modeText, sizeof(modeText));
-                if (modeLength == 1 && modeText[0] >= '0' && modeText[0] <= '5') {
-                    m_gfxSubBisectMode = static_cast<uint32_t>(modeText[0] - '0');
+                const DWORD modeLength = GetEnvironmentVariableA("OXRTK_PROXY_SYNC_TEST", modeText, sizeof(modeText));
+                if (modeLength == 1 && modeText[0] >= '0' && modeText[0] <= '2') {
+                    m_proxySyncMode = static_cast<uint32_t>(modeText[0] - '0');
                 } else if (modeLength != 0) {
-                    Log("[GFX-SUBBISECT] app=%s invalid OXRTK_GFX_SUBBISECT; using submode=0\n",
+                    Log("[PROXY-SYNC] app=%s invalid OXRTK_PROXY_SYNC_TEST; using mode=0\n",
                         m_applicationName.c_str());
                 }
-                // Submodes 0-3 share the hardware-stable Mode 2 device wrapper; 4-5 use Mode 3.
-                m_gfxBisectMode = m_gfxSubBisectMode >= 4 ? 3 : 2;
+                // All modes retain Submode 2's proxy/color/raw-copy path. Old bisect variables
+                // cannot silently select a different pipeline in this diagnostic build.
+                m_proxySyncEnabled = true;
+                m_gfxSubBisectMode = 2;
+                m_gfxBisectMode = 2;
             }
             Log("Application name: '%s', Engine name: '%s'\n",
                 createInfo->applicationInfo.applicationName,
@@ -999,6 +1002,7 @@ namespace {
                             m_applicationName.c_str(), m_gfxBisectMode);
                         m_gfxBisectMode = 0;
                         m_gfxSubBisectMode = 0;
+                        m_proxySyncEnabled = false;
                     }
                     if (m_gfxBisectMode > 0) {
                         // Keep the wrapper alive, but do not expose private images or initialize the processing chain.
@@ -1007,6 +1011,15 @@ namespace {
                                                                     m_configManager,
                                                                     false,
                                                                     true /* forceDisableInterceptor */);
+                        if (m_proxySyncEnabled) {
+                            m_bisectDevice->configureProxySyncDiagnostic(m_proxySyncMode, d3d12Bindings->queue);
+                            m_proxySyncReleaseLogs = 0;
+                            Log("[PROXY-SYNC] app=%s mode=%u base_submode=2 slots=32 "
+                                "allocator_safe=%u wait_current_copy=%u copy_point=release "
+                                "depth=direct overlays=0 postprocess=0 interceptor=0 analyzer=0\n",
+                                m_applicationName.c_str(), m_proxySyncMode, m_proxySyncMode > 0,
+                                m_proxySyncMode == 2);
+                        }
                     }
                     m_metroGraphicsSession = *session;
                     Log("[GFX-NEUTRAL] active app=%s session=%p api=%s app_queue=%p "
@@ -4256,8 +4269,13 @@ namespace {
             auto& state = m_swapchains.at(swapchain);
             const uint32_t imageIndex = state.acquiredImageIndex;
             const bool hasProxy = m_subProxySwapchains.at(swapchain);
+            graphics::ProxySyncSubmission submission;
+            auto& images = state.images.at(imageIndex);
+            const auto sourceBefore = m_proxySyncEnabled ? images.appTexture->getTrackedStateForDiagnostics() :
+                D3D12_RESOURCE_STATE_COMMON;
+            const auto destinationBefore = m_proxySyncEnabled ? images.runtimeTexture->getTrackedStateForDiagnostics() :
+                D3D12_RESOURCE_STATE_COMMON;
             if (hasProxy) {
-                auto& images = state.images.at(imageIndex);
                 // CopyResource covers every mip and array slice. ITexture::copyTo() copies only slice zero.
                 images.appTexture->pushState(D3D12_RESOURCE_STATE_COPY_SOURCE);
                 images.runtimeTexture->pushState(D3D12_RESOURCE_STATE_COPY_DEST);
@@ -4267,7 +4285,11 @@ namespace {
                 images.runtimeTexture->popState();
                 images.appTexture->popState();
                 // Submit the copy on the application's queue before telling the runtime the image is ready.
-                m_bisectDevice->flushContext();
+                if (m_proxySyncEnabled) {
+                    submission = m_bisectDevice->flushProxySyncCopy();
+                } else {
+                    m_bisectDevice->flushContext();
+                }
             }
             XrSwapchainImageReleaseInfo defaultInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             const XrResult result = OpenXrApi::xrReleaseSwapchainImage(
@@ -4275,12 +4297,58 @@ namespace {
             if (XR_SUCCEEDED(result)) {
                 state.delayedRelease = false;
             }
+            if (m_proxySyncEnabled && m_proxySyncReleaseLogs.fetch_add(1) < 128) {
+                // Print only after downstream release; console/file I/O must not become a hidden
+                // pre-release delay. Depth has no submission and never performs a diagnostic wait.
+                Log("[PROXY-SYNC] app=%s mode=%u kind=%s point=%s swapchain=%p "
+                    "proxy_resource=%p runtime_resource=%p proxy_index=%u runtime_index=%u "
+                    "arraySize=%u copy=%u state_source_before=0x%x state_source_after=0x%x "
+                    "state_destination_before=0x%x state_destination_after=0x%x "
+                    "states=wrapper_tracked barriers=%u copy_source=0x%x copy_dest=0x%x "
+                    "release_order=%s result=%s\n",
+                    m_applicationName.c_str(), m_proxySyncMode, hasProxy ? "color" : "depth", point, swapchain,
+                    images.appTexture->getNativePtr(), images.runtimeTexture->getNativePtr(), imageIndex,
+                    imageIndex, state.requestedArraySize, hasProxy, sourceBefore,
+                    images.appTexture->getTrackedStateForDiagnostics(), destinationBefore,
+                    images.runtimeTexture->getTrackedStateForDiagnostics(),
+                    hasProxy ? 2u * ((sourceBefore != D3D12_RESOURCE_STATE_COPY_SOURCE) +
+                                     (destinationBefore != D3D12_RESOURCE_STATE_COPY_DEST)) : 0u,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
+                    !hasProxy ? "direct_release" : m_proxySyncMode == 2 ?
+                        "execute_signal_verify_completion_release" : m_proxySyncMode == 1 ?
+                        "reuse_check_reset_execute_signal_release_no_current_wait" :
+                        "legacy_execute_reset_release_no_signal_no_wait", xr::ToCString(result));
+                if (hasProxy) {
+                    const auto& slot = submission.submittedSlot;
+                    const auto& next = submission.preparedNextSlot;
+                    Log("[PROXY-SYNC] mode=%u slot=%u allocator=%p list=%p queue=%p "
+                        "binding_queue=%p queues_match=%u fence=%p fence_tracking=%u "
+                        "previous_fence=%llu completed_before_reuse=%llu reuse_wait=%u reuse_wait_ms=%.3f "
+                        "execute=1 current_fence=%llu completed_before_copy_wait=%llu "
+                        "copy_wait=%u copy_wait_ms=%.3f completed_after_copy_wait=%llu "
+                        "completed_before_release=%llu completion_required=%u "
+                        "prepared_next_slot=%u next_allocator=%p next_list=%p next_previous_fence=%llu "
+                        "next_completed_before_reuse=%llu next_reuse_wait=%u next_reuse_wait_ms=%.3f "
+                        "next_reset_before_execute=%u\n",
+                        m_proxySyncMode, slot.slot, slot.allocator, slot.commandList, submission.queue,
+                        submission.bindingQueue, submission.queue == submission.bindingQueue, submission.fence,
+                        m_proxySyncMode > 0, static_cast<unsigned long long>(slot.previousFence),
+                        static_cast<unsigned long long>(slot.completedBeforeReuse), slot.waited, slot.waitMs,
+                        static_cast<unsigned long long>(submission.submissionFence),
+                        static_cast<unsigned long long>(submission.completedBeforeCopyWait), submission.copyWaited,
+                        submission.copyWaitMs, static_cast<unsigned long long>(submission.completedAfterCopyWait),
+                        static_cast<unsigned long long>(submission.completedBeforeRelease), m_proxySyncMode == 2,
+                        next.slot, next.allocator, next.commandList, static_cast<unsigned long long>(next.previousFence),
+                        static_cast<unsigned long long>(next.completedBeforeReuse), next.waited, next.waitMs,
+                        m_proxySyncMode > 0);
+                }
+            }
             if (m_subReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
                 Log("[GFX-SUBBISECT] app=%s submode=%u downstream_release point=%s swapchain=%p "
                     "runtime_index=%u proxy_index=%u copy=%u arraySize=%u command_list=%u "
-                    "fence_wait=0 result=%s\n", m_applicationName.c_str(), m_gfxSubBisectMode,
+                    "fence_wait=%u result=%s\n", m_applicationName.c_str(), m_gfxSubBisectMode,
                     point, swapchain, imageIndex, imageIndex, hasProxy, state.requestedArraySize,
-                    hasProxy, xr::ToCString(result));
+                    hasProxy, submission.copyWaited, xr::ToCString(result));
             }
             return result;
         }
@@ -4378,6 +4446,9 @@ namespace {
         XrSession m_vrSession{XR_NULL_HANDLE};
         uint32_t m_gfxBisectMode{0};
         uint32_t m_gfxSubBisectMode{0};
+        bool m_proxySyncEnabled{false};
+        uint32_t m_proxySyncMode{0};
+        std::atomic<uint32_t> m_proxySyncReleaseLogs{0};
         std::shared_ptr<graphics::IDevice> m_bisectDevice;
         XrSession m_metroGraphicsSession{XR_NULL_HANDLE};
         std::map<XrSwapchain, uint32_t> m_metroSwapchainIndices;
