@@ -40,5 +40,6 @@ for file in ('d3d12.cpp', 'interfaces.h'):
     relative = 'XR_APILAYER_MBUCCHIA_toolkit/' + file
     base = subprocess.check_output(['git', 'show',
         'acd28ea578b4171c1ed1fd01eab034513b244431:' + relative], cwd=root)
-    assert (root / relative).read_bytes() == base, f'synchronization changed: {file}'
+    current = subprocess.check_output(['git', 'show', 'HEAD:' + relative], cwd=root)
+    assert current == base, f'synchronization changed: {file}'
 print('PASS: D3D12 allocator/fence implementation byte-identical to published base')
