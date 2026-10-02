@@ -29,6 +29,7 @@
 #include "interfaces.h"
 #include "layer.h"
 #include "log.h"
+#include "proxy_usage_diagnostic.h"
 
 namespace {
 
@@ -164,6 +165,16 @@ namespace {
         std::array<uint8_t, 1024> postProcessorBlob;
 
         bool registeredWithFrameAnalyzer{false};
+    };
+
+    struct ProxyUsageState {
+        XrSession session{XR_NULL_HANDLE};
+        uint64_t id{0}, generation{0};
+        bool hasProxy{false}, strict{false};
+        std::string reason;
+        uint32_t roles{0}, lifecycleLogs{0};
+        uint64_t firstProjection{0}, firstOther{0}, acquires{0}, releases{0};
+        std::set<std::string> roleBindings;
     };
 
     class OpenXrLayer : public toolkit::OpenXrApi {
@@ -378,6 +389,21 @@ namespace {
                 m_proxySyncMode = 2;
                 m_gfxSubBisectMode = 2;
                 m_gfxBisectMode = 2;
+                // This branch tests usage only. Retain previous timing diagnostics, but pin their
+                // production selection to Mode 0 regardless of the old environment variables.
+                char usageText[8]{};
+                const DWORD usageLength = GetEnvironmentVariableA("OXRTK_PROXY_USAGE_TEST", usageText,
+                                                                   sizeof(usageText));
+                m_proxyUsageEnabled = true;
+                m_proxyUsageMode = proxy_usage::ParseMode(usageText, usageLength);
+                m_proxyTimingMode = 0;
+                m_proxyUsageAppIdentity = fmt::format("{}:{}:{}:{}", m_applicationName,
+                    createInfo->applicationInfo.applicationVersion, createInfo->applicationInfo.engineName,
+                    createInfo->applicationInfo.engineVersion);
+                Log("[PROXY-USAGE] startup app=%s mode=%u original_usage=per_swapchain "
+                    "downstream_transfer_dst=per_swapchain transfer_dst_test=%u copy_point=release runtime_release_point=release "
+                    "allocator_safe=1 wait_current_copy=1 old_timing_env=ignored\n",
+                    m_applicationName.c_str(), m_proxyUsageMode, m_proxyUsageMode);
             }
             Log("Application name: '%s', Engine name: '%s'\n",
                 createInfo->applicationInfo.applicationName,
@@ -1006,6 +1032,8 @@ namespace {
                         m_gfxBisectMode = 0;
                         m_gfxSubBisectMode = 0;
                         m_proxySyncEnabled = false;
+                        m_proxyUsageEnabled = false;
+                        Log("[PROXY-USAGE] unsupported reason=D3D12_binding_required\n");
                     }
                     if (m_gfxBisectMode > 0) {
                         // Keep the wrapper alive, but do not expose private images or initialize the processing chain.
@@ -1028,6 +1056,9 @@ namespace {
                         }
                     }
                     m_metroGraphicsSession = *session;
+                    if (m_proxyUsageEnabled && d3d12Bindings) {
+                        beginProxyUsageSession(*session, d3d12Bindings->device);
+                    }
                     Log("[GFX-NEUTRAL] active app=%s session=%p api=%s app_queue=%p "
                         "toolkit_device_wrapper=%u interceptor=0 frame_analyzer=0 "
                         "toolkit_command_lists=%u toolkit_fences=%u\n",
@@ -1403,6 +1434,9 @@ namespace {
             const XrResult result = OpenXrApi::xrDestroySession(session);
 
             if (XR_SUCCEEDED(result) && isMetroGraphicsSession(session)) {
+                if (m_proxyUsageEnabled) {
+                    finishProxyUsageSession();
+                }
                 m_swapchains.clear();
                 if (m_bisectDevice) {
                     // Keep the D3D12 wrapper alive until its diagnostic textures have been released.
@@ -1489,8 +1523,19 @@ namespace {
             if (isMetroGraphicsSession(session)) {
                 if (m_gfxSubBisectMode == 2 || m_gfxSubBisectMode == 3) {
                     // The runtime owns the swapchain. Only its color images are replaced for the app.
-                    const XrResult result = OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
+                    const bool isDepth = (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+                    const auto downstreamCreateInfo = proxy_usage::DownstreamCreateInfo(
+                        *createInfo, m_proxyUsageEnabled ? m_proxyUsageMode : 0, !isDepth);
+                    const XrResult result = OpenXrApi::xrCreateSwapchain(session, &downstreamCreateInfo, swapchain);
                     if (XR_FAILED(result)) {
+                        if (m_proxyUsageEnabled) {
+                            m_proxyUsageRunStrict = false;
+                            Log("[PROXY-USAGE] mode=%u event=create_rejected session=%p original_usage=0x%llx "
+                                "downstream_usage=0x%llx result=%s retry=0 strict_comparison=0 "
+                                "reason=runtime_rejected_variant\n", m_proxyUsageMode, session,
+                                static_cast<unsigned long long>(createInfo->usageFlags),
+                                static_cast<unsigned long long>(downstreamCreateInfo.usageFlags), xr::ToCString(result));
+                        }
                         return result;
                     }
                     uint32_t imageCount = 0;
@@ -1504,7 +1549,6 @@ namespace {
                     state.requestedWidth = createInfo->width;
                     state.requestedHeight = createInfo->height;
                     state.requestedArraySize = createInfo->arraySize;
-                    const bool isDepth = (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
                     const D3D12_RESOURCE_STATES initialState = isDepth ? D3D12_RESOURCE_STATE_DEPTH_WRITE :
                         (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) ?
                             D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COMMON;
@@ -1525,6 +1569,9 @@ namespace {
                     m_swapchains.insert_or_assign(*swapchain, std::move(state));
                     m_subProxySwapchains.insert_or_assign(*swapchain, !isDepth);
                     m_subProxyCopyCompleted.insert_or_assign(*swapchain, false);
+                    if (m_proxyUsageEnabled) {
+                        recordProxyUsageCreation(session, *swapchain, *createInfo, downstreamCreateInfo, initialState);
+                    }
                     Log("[GFX-SUBBISECT] create app=%s submode=%u swapchain=%p requested=%ux%u "
                         "arraySize=%u format=%lld sampleCount=%u usageFlags=0x%llx images=%u proxy=%u\n",
                         m_applicationName.c_str(), m_gfxSubBisectMode, *swapchain, createInfo->width,
@@ -1753,6 +1800,10 @@ namespace {
 
             const XrResult result = OpenXrApi::xrDestroySwapchain(swapchain);
             if (XR_SUCCEEDED(result)) {
+                if (m_proxyUsageEnabled && m_proxyUsageSwapchains.count(swapchain)) {
+                    summarizeProxyUsage(swapchain);
+                    m_proxyUsageSwapchains.erase(swapchain);
+                }
                 m_swapchains.erase(swapchain);
                 m_subProxySwapchains.erase(swapchain);
                 m_subProxyCopyCompleted.erase(swapchain);
@@ -2156,6 +2207,9 @@ namespace {
                 // Record the index so we know which texture to use in xrEndFrame().
                 if (swapchainIt != m_swapchains.end()) {
                     swapchainIt->second.acquiredImageIndex = *index;
+                    if (m_proxyUsageEnabled) {
+                        logProxyUsageAcquire(swapchain, *index);
+                    }
                     if (m_proxyTimingEnabled && m_subProxySwapchains.count(swapchain) &&
                         m_proxyTimingLogs.fetch_add(1) < 192) {
                         const auto& image = swapchainIt->second.images.at(*index);
@@ -2220,6 +2274,15 @@ namespace {
             auto swapchainIt = m_swapchains.find(swapchain);
             if (swapchainIt != m_swapchains.end()) {
                 if (m_subProxySwapchains.count(swapchain)) {
+                    if (m_proxyUsageEnabled) {
+                        if (swapchainIt->second.delayedRelease) {
+                            return XR_ERROR_CALL_ORDER_INVALID;
+                        }
+                        const auto result = releaseSubProxyImage(swapchain, "release", releaseInfo);
+                        // All resource queries, comparison and logs are AFTER downstream release.
+                        logProxyUsageRelease(swapchain, result);
+                        return result;
+                    }
                     if (m_proxyTimingEnabled) {
                         const bool hasProxy = m_subProxySwapchains.at(swapchain);
                         if (swapchainIt->second.delayedRelease) {
@@ -3432,6 +3495,9 @@ namespace {
                               TLArg(xr::ToCString(frameEndInfo->environmentBlendMode), "EnvironmentBlendMode"));
 
             if (isMetroGraphicsSession(session)) {
+                if (m_proxyUsageEnabled) {
+                    observeProxyUsageRoles(frameEndInfo);
+                }
                 // Complete every pending release before the runtime sees the submitted composition layers.
                 if (m_gfxSubBisectMode == 1) {
                     for (const auto& pending : m_subPendingDirectRelease) {
@@ -4282,6 +4348,419 @@ namespace {
         }
 
       private:
+        template <typename T>
+        static void usageField(proxy_usage::Snapshot& snapshot, const std::string& key, T value) {
+            snapshot[key] = std::to_string(value);
+        }
+
+        void writeProxyUsageReference() {
+            // Creation/teardown only: never called in the completion-to-release interval.
+            auto temporary = m_proxyUsagePath;
+            temporary += fmt::format(".{}.tmp", GetCurrentProcessId());
+            bool written = false;
+            try {
+                std::ofstream output(temporary, std::ios::trunc);
+                written = proxy_usage::WriteReference(output, m_proxyUsageCurrent);
+                output.close();
+                written = written && bool(output) && MoveFileExW(temporary.c_str(), m_proxyUsagePath.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+            } catch (const std::exception&) {
+                written = false;
+            }
+            if (!written) {
+                m_proxyUsageRunStrict = false;
+                Log("[PROXY-USAGE] reference_write_failed path=%s strict_comparison=0\n",
+                    m_proxyUsagePath.string().c_str());
+            }
+        }
+
+        void beginProxyUsageSession(XrSession session, ID3D12Device* device) {
+            m_proxyUsageSwapchains.clear();
+            m_proxyUsageCurrent = {};
+            m_proxyUsageReference = {};
+            m_proxyUsageCreationId = 0;
+            m_proxyUsageFrame = 0;
+            m_proxyUsageRunStrict = true;
+            const auto luid = device->GetAdapterLuid();
+            m_proxyUsageCurrent.identity = fmt::format("usage-v1/base-70af555/{}|{}|{}|adapter={}:{}",
+                m_proxyUsageAppIdentity, m_runtimeName, m_systemName, luid.HighPart, luid.LowPart);
+            m_proxyUsagePath = localAppData / "configs" /
+                fmt::format("proxy_usage_{}_U0.txt", m_applicationName);
+            std::error_code error;
+            std::filesystem::create_directories(m_proxyUsagePath.parent_path(), error);
+            m_proxyUsageReferenceValid = false;
+            if (m_proxyUsageMode == 1) {
+                const auto size = std::filesystem::file_size(m_proxyUsagePath, error);
+                if (!error && size <= 4 * 1024 * 1024) {
+                    std::ifstream input(m_proxyUsagePath);
+                    m_proxyUsageReferenceValid = proxy_usage::ReadReference(input, m_proxyUsageReference) &&
+                        m_proxyUsageReference.complete &&
+                        m_proxyUsageReference.identity == m_proxyUsageCurrent.identity;
+                }
+                m_proxyUsageRunStrict = m_proxyUsageReferenceValid;
+            } else {
+                // Invalidate the previous profile now, so an interrupted U0 cannot leave a stale complete reference.
+                writeProxyUsageReference();
+            }
+            Log("[PROXY-USAGE] session=%p mode=%u reference=%s reference_valid=%u "
+                "strict_comparison=%u comparison=%s reason=%s\n", session, m_proxyUsageMode,
+                m_proxyUsagePath.string().c_str(), m_proxyUsageReferenceValid, m_proxyUsageRunStrict,
+                m_proxyUsageMode ? "cross_run_U0" : "reference_self",
+                m_proxyUsageRunStrict ? "none" : "U0_reference_missing_incomplete_or_context_mismatch");
+        }
+
+        bool captureProxyUsageResource(ID3D12Resource* resource, const char* kind,
+                                       const ProxyUsageState& identity, XrSwapchain swapchain, uint32_t index,
+                                       proxy_usage::Snapshot& snapshot, bool compareResource) {
+            const auto desc = resource->GetDesc();
+            Log("[PROXY-RESOURCE] session=%p swapchain=%p generation=%llu creation_id=%llu "
+                "image_index=%u kind=%s resource=%p Dimension=%u Alignment=%llu Width=%llu Height=%u "
+                "DepthOrArraySize=%u MipLevels=%u Format=%u SampleCount=%u SampleQuality=%u Layout=%u Flags=0x%x\n",
+                identity.session, swapchain, static_cast<unsigned long long>(identity.generation),
+                static_cast<unsigned long long>(identity.id), index, kind, resource, desc.Dimension,
+                static_cast<unsigned long long>(desc.Alignment), static_cast<unsigned long long>(desc.Width),
+                desc.Height, desc.DepthOrArraySize, desc.MipLevels, desc.Format, desc.SampleDesc.Count,
+                desc.SampleDesc.Quality, desc.Layout, desc.Flags);
+            const auto prefix = fmt::format("image{}.{}.", index, kind);
+            if (compareResource) {
+                usageField(snapshot, prefix + "Dimension", static_cast<uint32_t>(desc.Dimension));
+                usageField(snapshot, prefix + "Alignment", desc.Alignment);
+                usageField(snapshot, prefix + "Width", desc.Width);
+                usageField(snapshot, prefix + "Height", desc.Height);
+                usageField(snapshot, prefix + "DepthOrArraySize", desc.DepthOrArraySize);
+                usageField(snapshot, prefix + "MipLevels", desc.MipLevels);
+                usageField(snapshot, prefix + "Format", static_cast<uint32_t>(desc.Format));
+                usageField(snapshot, prefix + "SampleCount", desc.SampleDesc.Count);
+                usageField(snapshot, prefix + "SampleQuality", desc.SampleDesc.Quality);
+                usageField(snapshot, prefix + "Layout", static_cast<uint32_t>(desc.Layout));
+                usageField(snapshot, prefix + "Flags", static_cast<uint32_t>(desc.Flags));
+            }
+            D3D12_HEAP_PROPERTIES heap{};
+            D3D12_HEAP_FLAGS flags{};
+            const auto heapResult = resource->GetHeapProperties(&heap, &flags);
+            if (SUCCEEDED(heapResult)) {
+                Log("[PROXY-RESOURCE] creation_id=%llu image_index=%u kind=%s GetHeapProperties=0x%08x "
+                    "Type=%u CPUPageProperty=%u MemoryPoolPreference=%u CreationNodeMask=%u "
+                    "VisibleNodeMask=%u HeapFlags=0x%x\n", static_cast<unsigned long long>(identity.id), index,
+                    kind, static_cast<unsigned>(heapResult), heap.Type, heap.CPUPageProperty,
+                    heap.MemoryPoolPreference, heap.CreationNodeMask, heap.VisibleNodeMask, flags);
+                if (compareResource) {
+                    usageField(snapshot, prefix + "HeapType", static_cast<uint32_t>(heap.Type));
+                    usageField(snapshot, prefix + "CPUPageProperty", static_cast<uint32_t>(heap.CPUPageProperty));
+                    usageField(snapshot, prefix + "MemoryPoolPreference", static_cast<uint32_t>(heap.MemoryPoolPreference));
+                    usageField(snapshot, prefix + "CreationNodeMask", heap.CreationNodeMask);
+                    usageField(snapshot, prefix + "VisibleNodeMask", heap.VisibleNodeMask);
+                    usageField(snapshot, prefix + "HeapFlags", static_cast<uint32_t>(flags));
+                }
+            } else {
+                Log("[PROXY-RESOURCE] creation_id=%llu image_index=%u kind=%s GetHeapProperties=0x%08x "
+                    "heap=unavailable\n", static_cast<unsigned long long>(identity.id), index, kind,
+                    static_cast<unsigned>(heapResult));
+            }
+            ComPtr<ID3D12Device> device;
+            auto planeResult = resource->GetDevice(IID_PPV_ARGS(set(device)));
+            D3D12_FEATURE_DATA_FORMAT_INFO formatInfo{desc.Format, 0};
+            if (SUCCEEDED(planeResult)) {
+                planeResult = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &formatInfo, sizeof(formatInfo));
+            }
+            if (SUCCEEDED(planeResult)) {
+                Log("[PROXY-RESOURCE] creation_id=%llu image_index=%u kind=%s plane_query=0x%08x "
+                    "real_format=%u plane_count=%u mip_count=%u array_size=%u samples=%u quality=%u\n",
+                    static_cast<unsigned long long>(identity.id), index, kind, static_cast<unsigned>(planeResult),
+                    desc.Format, formatInfo.PlaneCount, desc.MipLevels, desc.DepthOrArraySize,
+                    desc.SampleDesc.Count, desc.SampleDesc.Quality);
+                if (compareResource) {
+                    usageField(snapshot, prefix + "PlaneCount", formatInfo.PlaneCount);
+                }
+            } else {
+                Log("[PROXY-RESOURCE] creation_id=%llu image_index=%u kind=%s plane_query=0x%08x "
+                    "plane_count=unavailable real_format=%u\n", static_cast<unsigned long long>(identity.id),
+                    index, kind, static_cast<unsigned>(planeResult), desc.Format);
+            }
+            // Runtime heap changes are allowed consequences of downstream usage; proxy observations must be complete.
+            return !compareResource || (SUCCEEDED(heapResult) && SUCCEEDED(planeResult));
+        }
+
+        void recordProxyUsageCreation(XrSession session, XrSwapchain swapchain,
+                                       const XrSwapchainCreateInfo& original,
+                                       const XrSwapchainCreateInfo& downstream, D3D12_RESOURCE_STATES initialState) {
+            auto& identity = m_proxyUsageSwapchains[swapchain];
+            identity.session = session;
+            identity.id = ++m_proxyUsageCreationId;
+            identity.generation = ++m_proxyUsageGenerations[swapchain];
+            identity.hasProxy = m_subProxySwapchains.at(swapchain);
+            identity.strict = true;
+            proxy_usage::Snapshot snapshot;
+            usageField(snapshot, "width", original.width);
+            usageField(snapshot, "height", original.height);
+            usageField(snapshot, "arraySize", original.arraySize);
+            usageField(snapshot, "faceCount", original.faceCount);
+            usageField(snapshot, "mipCount", original.mipCount);
+            usageField(snapshot, "sampleCount", original.sampleCount);
+            usageField(snapshot, "requestedFormat", original.format);
+            usageField(snapshot, "createFlags", original.createFlags);
+            usageField(snapshot, "originalUsage", original.usageFlags);
+            usageField(snapshot, "hasProxy", identity.hasProxy);
+            usageField(snapshot, "initialLogicalState", static_cast<uint32_t>(initialState));
+            snapshot["copyPolicy"] = "CopyResource/release/allocatorSafe/currentCompletion/immediateRelease/sameQueue";
+            snapshot["proxyCreation"] = "original+runtimeFormat/committed/DEFAULT/SHARED/node1/clearNull/dataNull";
+            const auto& state = m_swapchains.at(swapchain);
+            usageField(snapshot, "imageCount", state.images.size());
+            if (state.images.empty()) {
+                identity.strict = false;
+                identity.reason = "no_swapchain_images";
+            }
+            if (original.next) {
+                identity.strict = false;
+                identity.reason = "uncompared_createInfo_next_chain";
+            }
+            for (uint32_t i = 0; i < state.images.size(); ++i) {
+                const auto& image = state.images[i];
+                auto* runtime = image.runtimeTexture->getAs<graphics::D3D12>();
+                auto* proxy = image.appTexture->getAs<graphics::D3D12>();
+                const auto runtimeDesc = runtime->GetDesc();
+                const auto proxyDesc = proxy->GetDesc();
+                usageField(snapshot, fmt::format("image{}.runtimeFormat", i), static_cast<uint32_t>(runtimeDesc.Format));
+                Log("[PROXY-RESOURCE] session=%p swapchain=%p generation=%llu creation_id=%llu image_index=%u "
+                    "runtime_resource=%p proxy_resource=%p has_proxy=%u role=unknown "
+                    "initial_state=0x%x states=wrapper_tracked_logical\n", session, swapchain,
+                    static_cast<unsigned long long>(identity.generation), static_cast<unsigned long long>(identity.id),
+                    i, runtime, proxy, identity.hasProxy, initialState);
+                captureProxyUsageResource(runtime, "runtime", identity, swapchain, i, snapshot, false);
+                if (!captureProxyUsageResource(proxy, "proxy", identity, swapchain, i, snapshot, true)) {
+                    identity.strict = false;
+                    identity.reason = "proxy_heap_or_plane_query_unavailable";
+                }
+                if (identity.hasProxy && (runtime == proxy || runtimeDesc.Dimension != proxyDesc.Dimension ||
+                    runtimeDesc.Width != proxyDesc.Width || runtimeDesc.Height != proxyDesc.Height ||
+                    runtimeDesc.DepthOrArraySize != proxyDesc.DepthOrArraySize ||
+                    runtimeDesc.MipLevels != proxyDesc.MipLevels || runtimeDesc.Format != proxyDesc.Format ||
+                    runtimeDesc.SampleDesc.Count != proxyDesc.SampleDesc.Count ||
+                    runtimeDesc.SampleDesc.Quality != proxyDesc.SampleDesc.Quality)) {
+                    identity.strict = false;
+                    identity.reason = "native_CopyResource_precondition_mismatch";
+                }
+            }
+            if (m_proxyUsageMode == 1) {
+                const auto found = m_proxyUsageReference.swapchains.find(identity.id);
+                if (!m_proxyUsageReferenceValid || found == m_proxyUsageReference.swapchains.end()) {
+                    identity.strict = false;
+                    identity.reason = "U0_reference_missing_incomplete_context_or_creation_id_mismatch";
+                } else {
+                    auto baseline = found->second;
+                    baseline.erase("observedRoles");
+                    const auto mismatch = proxy_usage::Compare(baseline, snapshot);
+                    if (!mismatch.empty()) {
+                        identity.strict = false;
+                        identity.reason = mismatch;
+                        const auto before = baseline.find(mismatch), after = snapshot.find(mismatch);
+                        Log("[PROXY-USAGE] creation_id=%llu invariant=%s U0=%s current=%s strict_comparison=0\n",
+                            static_cast<unsigned long long>(identity.id), mismatch.c_str(),
+                            before == baseline.end() ? "missing" : before->second.c_str(),
+                            after == snapshot.end() ? "missing" : after->second.c_str());
+                    }
+                }
+            }
+            m_proxyUsageRunStrict = m_proxyUsageRunStrict && identity.strict;
+            snapshot["observedRoles"] = "0";
+            m_proxyUsageCurrent.swapchains.emplace(identity.id, std::move(snapshot));
+            Log("[PROXY-USAGE] mode=%u session=%p swapchain=%p generation=%llu creation_id=%llu "
+                "width=%u height=%u arraySize=%u faceCount=%u mipCount=%u sampleCount=%u requested_format=%lld "
+                "createFlags=0x%llx original_usage=0x%llx downstream_usage=0x%llx "
+                "transfer_dst_added=%u transfer_dst_already_present=%u downstream_transfer_dst=%u "
+                "images=%zu has_proxy=%u role=unknown strict_comparison=%u reason=%s "
+                "comparison=%s final_summary_required=1\n", m_proxyUsageMode, session, swapchain,
+                static_cast<unsigned long long>(identity.generation), static_cast<unsigned long long>(identity.id),
+                original.width, original.height, original.arraySize, original.faceCount, original.mipCount,
+                original.sampleCount, static_cast<long long>(original.format),
+                static_cast<unsigned long long>(original.createFlags), static_cast<unsigned long long>(original.usageFlags),
+                static_cast<unsigned long long>(downstream.usageFlags), downstream.usageFlags != original.usageFlags,
+                (original.usageFlags & XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT) != 0,
+                (downstream.usageFlags & XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT) != 0, state.images.size(), identity.hasProxy,
+                identity.strict, identity.reason.empty() ? "none" : identity.reason.c_str(),
+                m_proxyUsageMode ? "cross_run_U0" : "reference_self");
+            if (m_proxyUsageMode == 0) {
+                writeProxyUsageReference();
+            }
+        }
+
+        void logProxyUsageAcquire(XrSwapchain swapchain, uint32_t index) {
+            auto found = m_proxyUsageSwapchains.find(swapchain);
+            if (found == m_proxyUsageSwapchains.end()) return;
+            auto& identity = found->second;
+            ++identity.acquires;
+            if (identity.lifecycleLogs++ < 24) {
+                const auto& image = m_swapchains.at(swapchain).images.at(index);
+                Log("[PROXY-USAGE] mode=%u event=acquire creation_id=%llu swapchain=%p frame=%llu "
+                    "runtime_index=%u proxy_index=%u P=%p R=%p has_proxy=%u\n", m_proxyUsageMode,
+                    static_cast<unsigned long long>(identity.id), swapchain,
+                    static_cast<unsigned long long>(m_proxyUsageFrame), index, index,
+                    image.appTexture->getNativePtr(), image.runtimeTexture->getNativePtr(), identity.hasProxy);
+            }
+        }
+
+        void logProxyUsageRelease(XrSwapchain swapchain, XrResult result) {
+            auto& identity = m_proxyUsageSwapchains.at(swapchain);
+            ++identity.releases;
+            if (XR_FAILED(result)) {
+                identity.strict = false;
+                identity.reason = "downstream_release_failed";
+                m_proxyUsageRunStrict = false;
+            }
+            const auto& state = m_swapchains.at(swapchain);
+            const auto& image = state.images.at(state.acquiredImageIndex);
+            if (identity.hasProxy) {
+                const auto& copy = m_proxyTimingCopies.at(swapchain);
+                const auto& submission = copy.submission;
+                if (submission.queue != submission.bindingQueue || !submission.submissionFence ||
+                    submission.completedAfterCopyWait < submission.submissionFence) {
+                    identity.strict = false;
+                    identity.reason = "queue_or_copy_completion_invariant";
+                    m_proxyUsageRunStrict = false;
+                }
+                if (identity.lifecycleLogs < 24) {
+                    Log("[PROXY-USAGE] mode=%u event=copy_report_after_runtime_release creation_id=%llu "
+                        "swapchain=%p frame=%llu runtime_index=%u proxy_index=%u P=%p R=%p operation=CopyResource "
+                        "copy_point=release runtime_release_point=release queue=%p binding_queue=%p queues_match=%u "
+                        "allocator_safe=1 wait_current_copy=1 slot=%u fence=%llu completed=%llu "
+                        "completion_verified=%u barriers=%u source_before=0x%x source_after=0x%x "
+                        "destination_before=0x%x destination_after=0x%x states=wrapper_tracked_logical "
+                        "copy_begin_tick=%llu completion_tick=%llu strict_comparison=%u result=%s\n",
+                        m_proxyUsageMode, static_cast<unsigned long long>(identity.id), swapchain,
+                        static_cast<unsigned long long>(m_proxyUsageFrame), state.acquiredImageIndex,
+                        state.acquiredImageIndex, image.appTexture->getNativePtr(), image.runtimeTexture->getNativePtr(),
+                        submission.queue, submission.bindingQueue, submission.queue == submission.bindingQueue,
+                        submission.submittedSlot.slot, static_cast<unsigned long long>(submission.submissionFence),
+                        static_cast<unsigned long long>(submission.completedAfterCopyWait),
+                        submission.completedAfterCopyWait >= submission.submissionFence,
+                        2u * ((copy.sourceBefore != D3D12_RESOURCE_STATE_COPY_SOURCE) +
+                              (copy.destinationBefore != D3D12_RESOURCE_STATE_COPY_DEST)),
+                        copy.sourceBefore, image.appTexture->getTrackedStateForDiagnostics(), copy.destinationBefore,
+                        image.runtimeTexture->getTrackedStateForDiagnostics(),
+                        static_cast<unsigned long long>(copy.copyBeginTick),
+                        static_cast<unsigned long long>(copy.completionTick), identity.strict, xr::ToCString(result));
+                }
+            }
+            if (identity.lifecycleLogs++ < 24) {
+                Log("[PROXY-USAGE] mode=%u event=downstream_release_return creation_id=%llu swapchain=%p "
+                    "frame=%llu runtime_index=%u proxy_index=%u has_proxy=%u runtime_release_point=release "
+                    "strict_comparison=%u result=%s\n", m_proxyUsageMode,
+                    static_cast<unsigned long long>(identity.id), swapchain,
+                    static_cast<unsigned long long>(m_proxyUsageFrame), state.acquiredImageIndex,
+                    state.acquiredImageIndex, identity.hasProxy, identity.strict, xr::ToCString(result));
+            }
+        }
+
+        static const char* proxyUsageRole(uint32_t roles) {
+            return roles == 3 ? "both" : roles == 1 ? "projection" : roles == 2 ? "other" : "unknown";
+        }
+
+        void observeProxyUsageRole(XrSwapchain swapchain, uint32_t role, uint32_t layer, uint32_t view,
+                                    uint32_t slice, const XrRect2Di* rect) {
+            auto found = m_proxyUsageSwapchains.find(swapchain);
+            if (found == m_proxyUsageSwapchains.end()) return;
+            auto& identity = found->second;
+            const auto previous = identity.roles;
+            identity.roles |= role;
+            const bool first = !(previous & role);
+            if (first) {
+                (role == 1 ? identity.firstProjection : identity.firstOther) = m_proxyUsageFrame;
+            }
+            m_proxyUsageCurrent.swapchains.at(identity.id)["observedRoles"] = std::to_string(identity.roles);
+            const auto rectText = rect ? xr::ToString(*rect) : "not_applicable";
+            const auto binding = fmt::format("{}:{}:{}:{}:{}", role, layer, view, slice, rectText);
+            const bool newBinding = identity.roleBindings.size() < 16 && identity.roleBindings.insert(binding).second;
+            if (first || newBinding) {
+                Log("[PROXY-ROLE] creation_id=%llu swapchain=%p generation=%llu frame=%llu "
+                    "use=%s role=%s previous_role=%s first_use=%u role_changed=%u layer=%u view=%u "
+                    "imageArrayIndex=%u imageRect=%s observation_only=1\n",
+                    static_cast<unsigned long long>(identity.id), swapchain,
+                    static_cast<unsigned long long>(identity.generation), static_cast<unsigned long long>(m_proxyUsageFrame),
+                    role == 1 ? "projection" : "other", proxyUsageRole(identity.roles), proxyUsageRole(previous),
+                    first, identity.roles != previous, layer, view, slice, rectText.c_str());
+            }
+        }
+
+        void observeProxyUsageRoles(const XrFrameEndInfo* info) {
+            // Read application composition only. Never select images, modify structs, copy or release here.
+            for (uint32_t i = 0; info->layers && i < info->layerCount; ++i) {
+                const auto* layer = info->layers[i];
+                if (!layer) continue;
+                if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                    const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+                    for (uint32_t view = 0; projection->views && view < projection->viewCount; ++view) {
+                        const auto& image = projection->views[view].subImage;
+                        observeProxyUsageRole(image.swapchain, 1, i, view, image.imageArrayIndex, &image.imageRect);
+                    }
+                } else {
+                    const XrSwapchainSubImage* image = nullptr;
+                    switch (layer->type) {
+                    case XR_TYPE_COMPOSITION_LAYER_QUAD:
+                        image = &reinterpret_cast<const XrCompositionLayerQuad*>(layer)->subImage; break;
+                    case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:
+                        image = &reinterpret_cast<const XrCompositionLayerCylinderKHR*>(layer)->subImage; break;
+                    case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:
+                        image = &reinterpret_cast<const XrCompositionLayerEquirectKHR*>(layer)->subImage; break;
+                    case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR:
+                        image = &reinterpret_cast<const XrCompositionLayerEquirect2KHR*>(layer)->subImage; break;
+                    case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR: {
+                        const auto* cube = reinterpret_cast<const XrCompositionLayerCubeKHR*>(layer);
+                        observeProxyUsageRole(cube->swapchain, 2, i, 0, cube->imageArrayIndex, nullptr); break;
+                    }
+                    default: break; // Unknown extensions are not guessed or classified.
+                    }
+                    if (image) {
+                        observeProxyUsageRole(image->swapchain, 2, i, 0, image->imageArrayIndex, &image->imageRect);
+                    }
+                }
+            }
+            ++m_proxyUsageFrame;
+        }
+
+        void summarizeProxyUsage(XrSwapchain swapchain) {
+            const auto& identity = m_proxyUsageSwapchains.at(swapchain);
+            Log("[PROXY-ROLE] event=summary creation_id=%llu swapchain=%p generation=%llu role=%s "
+                "projection_observed=%u other_observed=%u first_projection_frame=%llu first_other_frame=%llu "
+                "acquires=%llu releases=%llu strict_comparison=%u reason=%s\n",
+                static_cast<unsigned long long>(identity.id), swapchain,
+                static_cast<unsigned long long>(identity.generation), proxyUsageRole(identity.roles),
+                (identity.roles & 1) != 0, (identity.roles & 2) != 0,
+                static_cast<unsigned long long>(identity.firstProjection), static_cast<unsigned long long>(identity.firstOther),
+                static_cast<unsigned long long>(identity.acquires), static_cast<unsigned long long>(identity.releases),
+                identity.strict, identity.reason.empty() ? "none" : identity.reason.c_str());
+        }
+
+        void finishProxyUsageSession() {
+            for (const auto& entry : m_proxyUsageSwapchains) summarizeProxyUsage(entry.first);
+            std::string reason;
+            if (m_proxyUsageMode == 1 && m_proxyUsageReferenceValid) {
+                if (m_proxyUsageReference.swapchains.size() != m_proxyUsageCurrent.swapchains.size()) {
+                    reason = "total_swapchain_creation_count";
+                } else {
+                    for (const auto& entry : m_proxyUsageCurrent.swapchains) {
+                        auto baseline = m_proxyUsageReference.swapchains.find(entry.first);
+                        if (baseline == m_proxyUsageReference.swapchains.end() ||
+                            !baseline->second.count("observedRoles") ||
+                            baseline->second.at("observedRoles") != entry.second.at("observedRoles")) {
+                            reason = fmt::format("creation_id_{}_observed_roles", entry.first);
+                            break;
+                        }
+                    }
+                }
+                if (!reason.empty()) m_proxyUsageRunStrict = false;
+            }
+            if (m_proxyUsageMode == 0) {
+                m_proxyUsageCurrent.complete = m_proxyUsageRunStrict && !m_proxyUsageCurrent.swapchains.empty();
+                writeProxyUsageReference();
+            }
+            Log("[PROXY-USAGE] event=final_summary mode=%u creations=%zu frames=%llu strict_comparison=%u "
+                "reference_complete=%u reason=%s hidden_runtime_properties=uncompared\n", m_proxyUsageMode,
+                m_proxyUsageCurrent.swapchains.size(), static_cast<unsigned long long>(m_proxyUsageFrame),
+                m_proxyUsageRunStrict, m_proxyUsageMode ? m_proxyUsageReferenceValid : m_proxyUsageCurrent.complete,
+                !reason.empty() ? reason.c_str() : m_proxyUsageRunStrict ? "none" : "see_creation_or_reference_errors");
+            m_proxyUsageSwapchains.clear();
+        }
+
         bool isVrSystem(XrSystemId systemId) const {
             return systemId == m_vrSystemId;
         }
@@ -4553,6 +5032,14 @@ namespace {
         bool m_proxyTimingEnabled{false};
         uint32_t m_proxyTimingMode{0};
         std::atomic<uint32_t> m_proxyTimingLogs{0};
+        bool m_proxyUsageEnabled{false}, m_proxyUsageReferenceValid{false}, m_proxyUsageRunStrict{true};
+        uint32_t m_proxyUsageMode{0};
+        uint64_t m_proxyUsageCreationId{0}, m_proxyUsageFrame{0};
+        std::string m_proxyUsageAppIdentity;
+        std::filesystem::path m_proxyUsagePath;
+        proxy_usage::Reference m_proxyUsageReference, m_proxyUsageCurrent;
+        std::map<XrSwapchain, ProxyUsageState> m_proxyUsageSwapchains;
+        std::map<XrSwapchain, uint64_t> m_proxyUsageGenerations;
         std::shared_ptr<graphics::IDevice> m_bisectDevice;
         XrSession m_metroGraphicsSession{XR_NULL_HANDLE};
         std::map<XrSwapchain, uint32_t> m_metroSwapchainIndices;

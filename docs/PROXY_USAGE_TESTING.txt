@@ -1,0 +1,122 @@
+OpenXR Toolkit PSVR2 - Proxy Usage Diagnostic (U0 / U1)
+Base: 70af55571d6665abb25cff4e543e504628263391
+Branch: diag/proxy-transfer-dst-bisect
+Artifact: OpenXR-Toolkit-PSVR2-ProxyUsageDiag-x64
+
+Only exact application names Impact and TheMidnightWalk, D3D12.
+OXRTK_PROXY_USAGE_TEST: 0 = U0; 1 = U1; missing/invalid = 0.
+Old proxy timing/sync/graphics environment variables do not vary this experiment.
+All non-depth swapchains remain proxies, including any additional color images.
+Depth stays direct. No selection by size, role or composition layer is performed.
+
+U0: original usage downstream.
+U1: original | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT downstream, only for the
+runtime destinations of proxy copies. 0x61 becomes 0x71; 0x21 becomes 0x31.
+Depth and direct images are unchanged. An existing bit is logged and unchanged.
+The input createInfo and app-request metadata are preserved. Proxy creation
+still uses original createInfo plus the actual runtime native format override.
+No retry without the bit if the runtime rejects creation.
+
+Both modes retain Proxy Timing Mode 0 / Proxy Sync Mode 2:
+CopyResource at app xrReleaseSwapchainImage, original state transitions,
+same graphics-binding queue, safe allocator reuse, signal and completion wait
+for the current copy, immediate downstream release. No copy/release at EndFrame.
+Fence/allocator code and interfaces.h are unchanged. No new GPU work for logging.
+All new copy/release logs run AFTER downstream release; no I/O is inserted
+between completion of the copy and release to the runtime.
+
+PowerShell - U0 (run first)
+Close the game, SteamVR and Steam fully before changing mode.
+
+    $env:OXRTK_PROXY_USAGE_TEST = '0'
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_USAGE_TEST', '0', 'User')
+
+Restart Steam/SteamVR from a NEW login environment, or from this PowerShell:
+
+    Start-Process -FilePath "${env:ProgramFiles(x86)}\Steam\steam.exe"
+
+Launch the game normally in VR and reproduce the SAME test scene. Exit the game
+normally so xrDestroySession finalizes the U0 resource reference and final log.
+Keep the U0 log and profile. Do not run U0 and U1 simultaneously.
+
+PowerShell - inspect the U0 reference (The Midnight Walk)
+
+    $reference = Join-Path $env:LOCALAPPDATA 'OpenXR-Toolkit\configs\proxy_usage_TheMidnightWalk_U0.txt'
+    Get-Content -LiteralPath $reference -TotalCount 3
+    Get-FileHash -LiteralPath $reference -Algorithm SHA256
+
+For Impact, filename: proxy_usage_Impact_U0.txt in the same directory.
+The third line begins with 1 only for a complete, valid U0 session reference.
+Creation snapshots are saved with complete=0 until successful session teardown.
+Starting U0 invalidates the old profile; a crash/forced kill cannot finalize it.
+Use an unchanged game build, runtime, GPU/driver, resolution/settings, scene and
+launch sequence. Do not hand-edit profiles. Repeat U0 when those change.
+
+PowerShell - U1
+Close game, SteamVR and Steam fully again, then:
+
+    $env:OXRTK_PROXY_USAGE_TEST = '1'
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_USAGE_TEST', '1', 'User')
+    Start-Process -FilePath "${env:ProgramFiles(x86)}\Steam\steam.exe"
+
+Repeat the SAME scene and exit normally. U1 reads the completed U0 reference;
+it never overwrites it. No profile/malformed profile/incomplete profile/context
+mismatch means strict_comparison=0. U1 still executes its declared mode; it
+never changes a resource to make the comparison pass.
+
+strict_comparison semantics
+- U0 creation: reference_self, validates local observations/preconditions.
+- U1 creation: compares against U0 by sequential creation id and original request.
+  Checks image count, every native runtime format, full proxy GetDesc, observed
+  proxy heap properties/flags, plane count, initial logical state and fixed
+  creation/copy/synchronization recipe. First differing field and values are logged.
+- Runtime descriptor/heap changes are logged but permitted effects of the usage
+  variable. A change affecting the proxy (including its native format override)
+  sets strict_comparison=0. No automatic correction.
+- A non-null createInfo.next chain is not fully fingerprinted and conservatively
+  sets strict_comparison=0. Failed proxy heap/plane queries do the same.
+- Values at creation are provisional: the final_summary must also be 1.
+  Final summary checks total creations and observed role masks against U0.
+  Extra/missing/reordered resources, different roles or queue/completion errors
+  invalidate the run. Sequential ids are correlation, not universal semantic ids.
+- Equality covers measured invariants, not hidden runtime allocation properties,
+  actual UE5 GPU states, pixel correctness or complete rendering equivalence.
+
+Logs
+[PROXY-USAGE]: startup, original/downstream usage, bit added/already present,
+reference path/status, strict comparison reasons, sampled acquire/copy/release,
+and final session summary. Copy logs use P[i] -> R[i] and the same returned index.
+The copy_report_after_runtime_release event is a REPORT printed after release; the
+actual copy and completion occurred before release as the tick fields show.
+barriers count derives from the production push/pop transitions, not GPU capture.
+[PROXY-RESOURCE]: once per image at creation, full runtime/proxy descriptions,
+heap HRESULT/properties/flags or unavailable, real format and plane query.
+Creation is also the layer's internal runtime-image enumeration point.
+For direct depth P=R and has_proxy=0; no private depth resource is created.
+[PROXY-ROLE]: starts unknown. Projection view.subImage handles associate usage
+to creation id, layer/view, slice, rect and frame. First use, changed role and
+up to 16 distinct bindings per swapchain are logged, plus teardown summary.
+Quad, CylinderKHR, EquirectKHR, Equirect2KHR and CubeKHR are recognized as other.
+Unknown layer extensions are ignored, not guessed. Role may be unknown,
+projection, other or both. No projection observed does NOT confirm auxiliary.
+State values are wrapper-tracked/logical, never claimed to be observed GPU state.
+No resource selection, copy, release, frame struct or depth modification by roles.
+
+Interpretation
+U0 instavel + U1 estavel + strict_comparison=1 (including final_summary)
+-> declarar o uso de transferencia e relevante; not proof of a specific allocation fix.
+U0 instavel + U1 instavel
+-> TRANSFER_DST sozinho nao explica o wobble in this runtime/scenario.
+U1 rejeitado
+-> variante nao suportada; sem conclusao de estabilidade. No fallback/retry.
+strict_comparison=0
+-> nao interpretar como bisect de uma variavel; read the reason and rerun a valid pair.
+If U0 does not reproduce the wobble, the stability comparison is inconclusive.
+If there is no normal teardown/final summary, the strict comparison is incomplete.
+
+Cleanup (missing variable still selects U0 in this diagnostic branch)
+
+    Remove-Item Env:\OXRTK_PROXY_USAGE_TEST -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_USAGE_TEST', $null, 'User')
+
+This diagnostic is not a definitive fix. Hardware validation remains required.
