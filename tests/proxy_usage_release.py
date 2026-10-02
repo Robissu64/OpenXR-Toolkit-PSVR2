@@ -17,7 +17,9 @@ harness = next(ast.literal_eval(node.value) for node in tree.body if isinstance(
 harness = harness[:harness.index('int main()')]
 harness = harness.replace('#include <stdexcept>','#include <stdexcept>\n#include <set>\n#define XR_FAILED(x) ((x)<0)\nusing XrSession=uintptr_t;\nconstexpr uintptr_t XR_NULL_HANDLE=0;')
 harness = harness.replace('struct Fixture {', block(layer,'struct ProxyUsageState')+';\nstruct Fixture {')
-harness = harness.replace('    RECORD', '''    bool m_proxyUsageEnabled=true,m_proxyUsageRunStrict=true;
+harness = harness.replace('    RECORD', '''    bool m_proxyScopeEnabled=false;
+    void logProxyScopeRelease(XrSwapchain,XrResult,bool) {}
+    bool m_proxyUsageEnabled=true,m_proxyUsageRunStrict=true;
     unsigned m_proxyUsageMode=0;
     uint64_t m_proxyUsageFrame=0;
     std::map<XrSwapchain,ProxyUsageState> m_proxyUsageSwapchains;

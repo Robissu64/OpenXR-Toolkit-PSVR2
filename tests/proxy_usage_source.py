@@ -55,14 +55,20 @@ create = block(layer[layer.index('XrResult xrCreateSwapchain'):], 'if (m_gfxSubB
 assert create.count('OpenXrApi::xrCreateSwapchain(') == 1
 assert '&downstreamCreateInfo' in create and 'return result;' in block(create, 'if (XR_FAILED(result))')
 assert 'usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT' in create
-assert block(create, 'for (uint32_t i = 0; i < imageCount; ++i)') == block(base[base.index('XrResult xrCreateSwapchain'):], 'for (uint32_t i = 0; i < imageCount; ++i)')
-assert 'm_subProxySwapchains.insert_or_assign(*swapchain, !isDepth)' in create
+creation_loop = block(create, 'for (uint32_t i = 0; i < imageCount; ++i)')
+if 'm_proxyScopeEnabled' in create:
+    # Scope deliberately changes selection; the private resource recipe stays identical.
+    creation_loop = creation_loop.replace('if (!hasProxy)', 'if (isDepth)')
+    assert 'm_subProxySwapchains.insert_or_assign(*swapchain, hasProxy)' in create
+else:
+    assert 'm_subProxySwapchains.insert_or_assign(*swapchain, !isDepth)' in create
+assert creation_loop == block(base[base.index('XrResult xrCreateSwapchain'):], 'for (uint32_t i = 0; i < imageCount; ++i)')
 policy = block(header, 'inline XrSwapchainCreateInfo DownstreamCreateInfo')
 assert 'auto downstream = original;' in policy
 assert 'hasProxy' in policy and 'XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT' in policy
 assert 'downstream.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;' in policy
 assert policy.count('downstream.') == 1
-print('PASS: only downstream bit changes, no retry, original proxy creation and scope unchanged')
+print('PASS: legacy usage policy, no retry and private proxy recipe unchanged; scope selection tested separately')
 
 for marker in ('void observeProxyUsageRoles', 'void observeProxyUsageRole'):
     method = block(layer, marker)

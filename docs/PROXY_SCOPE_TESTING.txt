@@ -1,0 +1,127 @@
+OpenXR Toolkit PSVR2 - Proxy Scope Bisect
+Branch: diag/proxy-scope-bisect
+Base: 4cfd21728346de59f8f45ea99f1869ed33274459
+Artifact: OpenXR-Toolkit-PSVR2-ProxyScopeDiag-x64
+
+Only Impact and TheMidnightWalk, D3D12. Missing/invalid scope mode selects 0.
+OXRTK_PROXY_USAGE_TEST and old timing/sync/graphics variables are ignored.
+Runtime usage is ALWAYS original: no TRANSFER_DST is added in this build.
+
+0 = C = controle: all non-depth color images proxy.
+1 = A = projection-only proxy: persisted projection proxy; persisted other direct.
+2 = B = auxiliary-only proxy: persisted projection direct; persisted other proxy.
+"Auxiliary" here means observed other composition color (role 2), not small size.
+Depth stays direct in every mode, independently recognized from original usage.
+
+Required reference - DO NOT DELETE OR EDIT DURING C/A/B
+%LOCALAPPDATA%\OpenXR-Toolkit\configs\proxy_usage_TheMidnightWalk_U0.txt
+For Impact: proxy_usage_Impact_U0.txt in the same directory.
+Must be a completed PROXY_USAGE_V1 profile from the original Proxy Usage U0 build.
+Scope Mode 0 DOES NOT generate/refresh that reference. All scope modes read it
+without overwriting, invalidating or deleting it. Missing reference gives safe
+control fallback and strict_scope_comparison=0, not a usable A/B experiment.
+
+Selection happens ONCE at xrCreateSwapchain, before application enumeration.
+A sequential creation id finds the reference record; all nine original fields
+must match: width, height, arraySize, faceCount, mipCount, sampleCount,
+requestedFormat, createFlags and originalUsage. No dimension or id is hardcoded.
+Runtime/app handles and resource pointers are never reused across processes.
+observedRoles=1 -> projection; observedRoles=2 -> other. A non-depth record must
+also originate from the all-proxy U0 policy (hasProxy=1). Unknown (0), both (3),
+missing roles, mismatched signatures or missing/incomplete/context-invalid
+reference -> control proxy for that color and strict_scope_comparison=0.
+Depth is still direct on fallback. Non-null createInfo.next is conservatively
+uncompared/invalid, as in the reference diagnostic.
+
+Direct images: appTexture == runtimeTexture, no private allocation, no copy.
+Proxy images: same original createInfo + runtime format override, same private
+resource recipe, raw CopyResource at app release, same push/pop barriers,
+same queue, allocator-safe, current-copy completion wait, immediate runtime
+release. No self-copy, empty copy or artificial completion wait on direct images.
+Existing begin/end-frame flushes stay unchanged. EndFrame forwards the original
+frame info. Resources exposed to the app NEVER change dynamically after creation.
+
+PowerShell - prepare and preserve the reference
+Close the game, SteamVR and Steam fully. Keep game/runtime/GPU/driver/settings,
+resolution, scene and launch sequence identical across runs.
+
+    $reference = Join-Path $env:LOCALAPPDATA 'OpenXR-Toolkit\configs\proxy_usage_TheMidnightWalk_U0.txt'
+    Get-Content -LiteralPath $reference -TotalCount 3
+    $referenceHash = (Get-FileHash -LiteralPath $reference -Algorithm SHA256).Hash
+
+The third line must begin with 1 (complete). Install the Scope diagnostic DLL
+using its packaged installer. Do not use this DLL to regenerate the old U0 file.
+
+Mode 0 / C
+
+    $env:OXRTK_PROXY_SCOPE_TEST = '0'
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST', '0', 'User')
+    Start-Process -FilePath "${env:ProgramFiles(x86)}\Steam\steam.exe"
+
+Mode 1 / A - close game/SteamVR/Steam fully between runs
+
+    $env:OXRTK_PROXY_SCOPE_TEST = '1'
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST', '1', 'User')
+    Start-Process -FilePath "${env:ProgramFiles(x86)}\Steam\steam.exe"
+
+Mode 2 / B - close game/SteamVR/Steam fully between runs
+
+    $env:OXRTK_PROXY_SCOPE_TEST = '2'
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST', '2', 'User')
+    Start-Process -FilePath "${env:ProgramFiles(x86)}\Steam\steam.exe"
+
+Launch normally in VR, reproduce the SAME scene, exit normally and save each
+log separately. Do not run overlapping sessions. Verify preservation afterward:
+
+    if ((Get-FileHash -LiteralPath $reference -Algorithm SHA256).Hash -ne $referenceHash) { throw 'U0 reference changed' }
+
+Expected CURRENT The Midnight Walk profile (examples only, not production rules):
+creation 1 role 1 projection; creation 2 depth; creations 3/4 role 2 other.
+C paths: proxy, direct, proxy, proxy.
+A paths: proxy, direct, direct, direct.
+B paths: direct, direct, proxy, proxy.
+
+Logs and strict scope validation
+[PROXY-SCOPE] startup: mode/path/valid/complete, queue and read-only reference.
+Creation: role, original signature, selected path and fallback/invariant reasons.
+Current EndFrame: actual handles determine accumulated roles. A different role
+immediately invalidates the run (reason=role_mismatch); selection never changes.
+Absent expected role at teardown also invalidates it. Roles are observations,
+not an assertion that an unknown/non-projection image is auxiliary.
+Releases: actual copy_performed, operation=CopyResource|none and runtime result.
+The report is printed AFTER downstream release; no new I/O is inserted between
+copy completion and downstream release. Retry after a failed runtime release may
+have copy_performed=0 because the existing completed-copy dedup is unchanged.
+Final summary: projection/other proxy/direct counts, total creations, frames,
+strict_scope_comparison, reference_complete and first failure reason.
+Require strict_scope_comparison=1 in the FINAL summary, not only at creation.
+
+Compare image counts, native runtime formats and original createInfo against U0.
+hasProxy intentionally changes and is not compared for equality. Private proxy
+fields are compared only for resources that remain proxy. Full actual runtime
+GetDesc/heap properties are still logged. The old 4cfd217 PROXY_USAGE_V1 profile
+stores runtimeFormat but NOT full runtime descriptor/heap fields: those comparisons
+are explicitly unavailable_in_reference. If such fields exist in a compatible
+reference, compare every available field. Do not infer runtime properties from
+old proxy properties. strict_scope_comparison=1 covers the available invariants;
+it does not prove equivalence of unrecorded/hidden runtime allocation properties.
+Logical state logs are wrapper-tracked, not an observation of real GPU state.
+Legacy [PROXY-TIMING] kind=depth can also mean a direct color in this branch;
+[PROXY-SCOPE] selected_path/reference_role identifies those images unambiguously.
+
+Interpretation (C unstable and all final comparisons valid):
+A unstable + B stable -> projection proxy path is sufficient in this scenario.
+A stable + B unstable -> other color proxy path is sufficient; projection proxy
+is not necessary. Split other color resources in a later approved experiment.
+A/B unstable -> each subset is sufficient; no exclusivity established.
+A/B stable -> interaction, total work or classification needs further evidence.
+Removing proxies necessarily removes their copies/barriers/waits; GPU load is
+not equalized with invalid/dummy operations. No root cause is proved by scope.
+Any strict_scope_comparison=0 -> do not interpret as a valid scope bisect.
+C stable -> baseline failed to reproduce; A/B stability is inconclusive.
+Missing final summary -> validation incomplete. No automated fix or new hypothesis.
+
+Cleanup (absence still selects C in this diagnostic build)
+
+    Remove-Item Env:\OXRTK_PROXY_SCOPE_TEST -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST', $null, 'User')

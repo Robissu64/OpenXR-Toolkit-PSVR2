@@ -39,7 +39,9 @@ struct XrSwapchainCreateInfo {
     int64_t format=91; uint32_t sampleCount=1,width=4128,height=2208,faceCount=1,arraySize=1,mipCount=1;
 };
 #include "proxy_usage_diagnostic.h"
+#include "proxy_scope_diagnostic.h"
 using namespace toolkit;
+using ID3D12CommandQueue=void;
 using D3D12_RESOURCE_STATES=unsigned;
 constexpr unsigned D3D12_RESOURCE_STATE_COPY_SOURCE=0x800,D3D12_RESOURCE_STATE_COPY_DEST=0x400;
 using D3D12_HEAP_FLAGS=unsigned;
@@ -117,6 +119,13 @@ struct OpenXrApi {
     }
 };
 struct Fixture {
+    bool m_proxyScopeEnabled=false;
+    std::map<uint64_t,proxy_scope::Decision> m_proxyScopeDecisions;
+    proxy_scope::Decision selectProxyScope(const XrSwapchainCreateInfo&) {return {};}
+    void invalidateProxyScope(const std::string&) {}
+    void recordProxyScopeCreation(XrSwapchain,const XrSwapchainCreateInfo&,const proxy_usage::Snapshot&,ProxyUsageState&) {}
+    void validateProxyScopeRole(uint64_t,uint32_t,bool) {}
+    void finishProxyScopeSession() {}
     uint32_t m_proxyUsageMode=0;bool m_proxyUsageEnabled=true,m_proxyUsageRunStrict=true,m_proxyUsageReferenceValid=false;
     uint64_t m_proxyUsageCreationId=0,m_proxyUsageFrame=0;
     proxy_usage::Reference m_proxyUsageReference,m_proxyUsageCurrent;

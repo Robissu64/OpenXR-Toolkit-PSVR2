@@ -30,6 +30,7 @@
 #include "layer.h"
 #include "log.h"
 #include "proxy_usage_diagnostic.h"
+#include "proxy_scope_diagnostic.h"
 
 namespace {
 
@@ -389,8 +390,8 @@ namespace {
                 m_proxySyncMode = 2;
                 m_gfxSubBisectMode = 2;
                 m_gfxBisectMode = 2;
-                // This branch tests usage only. Retain previous timing diagnostics, but pin their
-                // production selection to Mode 0 regardless of the old environment variables.
+                // Retain prior usage/timing diagnostics; scope below pins their production selection
+                // to U0 / timing Mode 0 regardless of the old environment variables.
                 char usageText[8]{};
                 const DWORD usageLength = GetEnvironmentVariableA("OXRTK_PROXY_USAGE_TEST", usageText,
                                                                    sizeof(usageText));
@@ -400,6 +401,15 @@ namespace {
                 m_proxyUsageAppIdentity = fmt::format("{}:{}:{}:{}", m_applicationName,
                     createInfo->applicationInfo.applicationVersion, createInfo->applicationInfo.engineName,
                     createInfo->applicationInfo.engineVersion);
+                char scopeText[8]{};
+                const auto scopeLength = GetEnvironmentVariableA("OXRTK_PROXY_SCOPE_TEST", scopeText, sizeof(scopeText));
+                m_proxyScopeEnabled = true;
+                m_proxyScopeMode = proxy_scope::ParseMode(scopeText, scopeLength);
+                m_proxyUsageMode = 0; // Usage/timing/sync/graphics environment variables cannot vary scope.
+                m_proxyTimingMode = 0;
+                Log("[PROXY-SCOPE] app=%s mode=%u usage=original copy_point=release "
+                    "runtime_release_point=release allocator_safe=1 wait_current_copy=1 old_envs=ignored\n",
+                    m_applicationName.c_str(), m_proxyScopeMode);
                 Log("[PROXY-USAGE] startup app=%s mode=%u original_usage=per_swapchain "
                     "downstream_transfer_dst=per_swapchain transfer_dst_test=%u copy_point=release runtime_release_point=release "
                     "allocator_safe=1 wait_current_copy=1 old_timing_env=ignored\n",
@@ -1033,6 +1043,7 @@ namespace {
                         m_gfxSubBisectMode = 0;
                         m_proxySyncEnabled = false;
                         m_proxyUsageEnabled = false;
+                        m_proxyScopeEnabled = false;
                         Log("[PROXY-USAGE] unsupported reason=D3D12_binding_required\n");
                     }
                     if (m_gfxBisectMode > 0) {
@@ -1058,6 +1069,7 @@ namespace {
                     m_metroGraphicsSession = *session;
                     if (m_proxyUsageEnabled && d3d12Bindings) {
                         beginProxyUsageSession(*session, d3d12Bindings->device);
+                        if (m_proxyScopeEnabled) beginProxyScopeSession(d3d12Bindings->queue);
                     }
                     Log("[GFX-NEUTRAL] active app=%s session=%p api=%s app_queue=%p "
                         "toolkit_device_wrapper=%u interceptor=0 frame_analyzer=0 "
@@ -1524,10 +1536,13 @@ namespace {
                 if (m_gfxSubBisectMode == 2 || m_gfxSubBisectMode == 3) {
                     // The runtime owns the swapchain. Only its color images are replaced for the app.
                     const bool isDepth = (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+                    const auto scope = m_proxyScopeEnabled ? selectProxyScope(*createInfo) : proxy_scope::Decision{};
+                    const bool hasProxy = !isDepth && (!m_proxyScopeEnabled || scope.hasProxy);
                     const auto downstreamCreateInfo = proxy_usage::DownstreamCreateInfo(
-                        *createInfo, m_proxyUsageEnabled ? m_proxyUsageMode : 0, !isDepth);
+                        *createInfo, m_proxyScopeEnabled ? 0 : (m_proxyUsageEnabled ? m_proxyUsageMode : 0), hasProxy);
                     const XrResult result = OpenXrApi::xrCreateSwapchain(session, &downstreamCreateInfo, swapchain);
                     if (XR_FAILED(result)) {
+                        if (m_proxyScopeEnabled) invalidateProxyScope("runtime_create_rejected");
                         if (m_proxyUsageEnabled) {
                             m_proxyUsageRunStrict = false;
                             Log("[PROXY-USAGE] mode=%u event=create_rejected session=%p original_usage=0x%llx "
@@ -1557,7 +1572,7 @@ namespace {
                         images.runtimeTexture = graphics::WrapD3D12Texture(
                             m_bisectDevice, *createInfo, runtimeImages[i].texture, initialState,
                             fmt::format("Sub-bisect runtime swapchain {} TEX2D", i));
-                        if (isDepth) {
+                        if (!hasProxy) {
                             images.appTexture = images.runtimeTexture;
                         } else {
                             const auto format = static_cast<int64_t>(runtimeImages[i].texture->GetDesc().Format);
@@ -1567,9 +1582,12 @@ namespace {
                         state.images.push_back(std::move(images));
                     }
                     m_swapchains.insert_or_assign(*swapchain, std::move(state));
-                    m_subProxySwapchains.insert_or_assign(*swapchain, !isDepth);
+                    m_subProxySwapchains.insert_or_assign(*swapchain, hasProxy);
                     m_subProxyCopyCompleted.insert_or_assign(*swapchain, false);
                     if (m_proxyUsageEnabled) {
+                        if (m_proxyScopeEnabled) {
+                            m_proxyScopeDecisions.emplace(m_proxyUsageCreationId + 1, scope);
+                        }
                         recordProxyUsageCreation(session, *swapchain, *createInfo, downstreamCreateInfo, initialState);
                     }
                     Log("[GFX-SUBBISECT] create app=%s submode=%u swapchain=%p requested=%ux%u "
@@ -1577,7 +1595,7 @@ namespace {
                         m_applicationName.c_str(), m_gfxSubBisectMode, *swapchain, createInfo->width,
                         createInfo->height, createInfo->arraySize, static_cast<long long>(createInfo->format),
                         createInfo->sampleCount, static_cast<unsigned long long>(createInfo->usageFlags),
-                        imageCount, !isDepth);
+                        imageCount, hasProxy);
                     return result;
                 }
                 // Every image returned to this diagnostic application is owned by the runtime.
@@ -2278,9 +2296,11 @@ namespace {
                         if (swapchainIt->second.delayedRelease) {
                             return XR_ERROR_CALL_ORDER_INVALID;
                         }
+                        const bool copiedNow = m_subProxySwapchains.at(swapchain) && !m_subProxyCopyCompleted[swapchain];
                         const auto result = releaseSubProxyImage(swapchain, "release", releaseInfo);
                         // All resource queries, comparison and logs are AFTER downstream release.
                         logProxyUsageRelease(swapchain, result);
+                        if (m_proxyScopeEnabled) logProxyScopeRelease(swapchain, result, copiedNow);
                         return result;
                     }
                     if (m_proxyTimingEnabled) {
@@ -4348,12 +4368,148 @@ namespace {
         }
 
       private:
+        void invalidateProxyScope(const std::string& reason) {
+            m_proxyScopeStrict = false;
+            if (m_proxyScopeReason.empty()) m_proxyScopeReason = reason;
+        }
+
+        void beginProxyScopeSession(ID3D12CommandQueue* queue) {
+            m_proxyScopeDecisions.clear();
+            m_proxyScopeReleaseLogs.clear();
+            m_proxyScopeQueue = queue;
+            m_proxyScopeStrict = m_proxyUsageReferenceValid;
+            m_proxyScopeReason.clear();
+            if (!m_proxyScopeStrict) invalidateProxyScope("reference_missing_incomplete_or_context_mismatch");
+            Log("[PROXY-SCOPE] app=%s mode=%u reference_path=%s reference_valid=%u reference_complete=%u "
+                "classification=cross_run_observed_role fallback=control_proxy reference_read_only=1 "
+                "strict_scope_comparison=%u reason=%s queue=%p\n", m_applicationName.c_str(), m_proxyScopeMode,
+                m_proxyUsagePath.string().c_str(), m_proxyUsageReferenceValid, m_proxyUsageReference.complete,
+                m_proxyScopeStrict, m_proxyScopeReason.empty() ? "none" : m_proxyScopeReason.c_str(), queue);
+        }
+
+        proxy_scope::Decision selectProxyScope(const XrSwapchainCreateInfo& original) const {
+            const auto found = m_proxyUsageReference.swapchains.find(m_proxyUsageCreationId + 1);
+            return proxy_scope::Select(original, m_proxyScopeMode,
+                found == m_proxyUsageReference.swapchains.end() ? nullptr : &found->second,
+                m_proxyUsageReferenceValid);
+        }
+
+        void recordProxyScopeCreation(XrSwapchain swapchain, const XrSwapchainCreateInfo& original,
+                                       const proxy_usage::Snapshot& snapshot, ProxyUsageState& identity) {
+            auto& decision = m_proxyScopeDecisions.at(identity.id);
+            const auto found = m_proxyUsageReference.swapchains.find(identity.id);
+            size_t runtimeFields = 0;
+            if (decision.strict && found != m_proxyUsageReference.swapchains.end()) {
+                for (const auto& field : found->second) {
+                    runtimeFields += field.first.find(".runtime.") != std::string::npos;
+                }
+                const auto mismatch = proxy_scope::CompareResources(found->second, snapshot, decision.hasProxy);
+                if (!mismatch.empty()) {
+                    decision.strict = false;
+                    decision.reason = "resource_" + mismatch;
+                }
+            }
+            if (!identity.strict) {
+                decision.strict = false;
+                if (decision.reason.empty()) decision.reason = identity.reason;
+            }
+            if (!decision.strict) invalidateProxyScope(decision.reason);
+            Log("[PROXY-SCOPE] event=create mode=%u creation_id=%llu swapchain=%p reference_role=%u "
+                "current_depth=%u selected_path=%s width=%u height=%u arraySize=%u faceCount=%u mipCount=%u "
+                "sampleCount=%u requested_format=%lld original_usage=0x%llx createFlags=0x%llx "
+                "signature_match=%u strict_scope_comparison=%u reason=%s image_count=%zu "
+                "runtime_fields_compared=%zu runtime_descriptor_heap_reference=%s\n", m_proxyScopeMode,
+                static_cast<unsigned long long>(identity.id), swapchain, decision.referenceRole,
+                (original.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0,
+                decision.hasProxy ? "proxy" : "direct", original.width, original.height, original.arraySize,
+                original.faceCount, original.mipCount, original.sampleCount, static_cast<long long>(original.format),
+                static_cast<unsigned long long>(original.usageFlags), static_cast<unsigned long long>(original.createFlags),
+                decision.signatureMatch, m_proxyScopeStrict, decision.reason.empty() ? "none" : decision.reason.c_str(),
+                m_swapchains.at(swapchain).images.size(), runtimeFields,
+                runtimeFields ? "available_fields_only" : "unavailable_in_reference");
+        }
+
+        void validateProxyScopeRole(uint64_t id, uint32_t observed, bool emit) {
+            auto& decision = m_proxyScopeDecisions.at(id);
+            const bool match = decision.referenceRole == observed;
+            if (!match) {
+                decision.strict = false;
+                decision.reason = "role_mismatch";
+                invalidateProxyScope("role_mismatch");
+            }
+            if (emit) {
+                Log("[PROXY-SCOPE] event=role creation_id=%llu frame=%llu reference_role=%u "
+                    "observed_current_role=%u projection_observed=%u other_observed=%u role_match=%u "
+                    "selected_path=%s strict_scope_comparison=%u reason=%s observation_only=1\n",
+                    static_cast<unsigned long long>(id), static_cast<unsigned long long>(m_proxyUsageFrame),
+                    decision.referenceRole, observed, (observed & 1) != 0, (observed & 2) != 0, match,
+                    decision.hasProxy ? "proxy" : "direct", m_proxyScopeStrict, match ? "none" : "role_mismatch");
+            }
+        }
+
+        void logProxyScopeRelease(XrSwapchain swapchain, XrResult result, bool copiedNow) {
+            // Called after the existing helper has returned from downstream release.
+            const auto id = m_proxyUsageSwapchains.at(swapchain).id;
+            auto& decision = m_proxyScopeDecisions.at(id);
+            if (XR_FAILED(result)) {
+                decision.strict = false;
+                decision.reason = "runtime_release_failed";
+                invalidateProxyScope(decision.reason);
+            }
+            if (decision.hasProxy) {
+                const auto& submission = m_proxyTimingCopies.at(swapchain).submission;
+                if (submission.queue != m_proxyScopeQueue || submission.bindingQueue != m_proxyScopeQueue ||
+                    !submission.submissionFence || submission.completedAfterCopyWait < submission.submissionFence) {
+                    decision.strict = false;
+                    decision.reason = "queue_or_copy_completion_mismatch";
+                    invalidateProxyScope(decision.reason);
+                }
+            }
+            if (m_proxyScopeReleaseLogs[id]++ < 12) {
+                Log("[PROXY-SCOPE] event=release mode=%u creation_id=%llu selected_path=%s "
+                    "copy_performed=%u operation=%s copy_point=release runtime_release_point=release "
+                    "queue=%p strict_scope_comparison=%u runtime_release_result=%s\n",
+                    m_proxyScopeMode, static_cast<unsigned long long>(id), decision.hasProxy ? "proxy" : "direct",
+                    copiedNow, copiedNow ? "CopyResource" : "none", m_proxyScopeQueue, m_proxyScopeStrict,
+                    xr::ToCString(result));
+            }
+        }
+
+        void finishProxyScopeSession() {
+            uint32_t projectionProxy = 0, otherProxy = 0, projectionDirect = 0, otherDirect = 0;
+            if (!m_proxyUsageReferenceValid || m_proxyUsageReference.swapchains.size() != m_proxyUsageCurrent.swapchains.size()) {
+                invalidateProxyScope("creation_sequence_or_reference_mismatch");
+            }
+            for (const auto& entry : m_proxyUsageCurrent.swapchains) {
+                const auto roles = entry.second.find("observedRoles");
+                if (roles == entry.second.end()) {
+                    invalidateProxyScope("current_roles_missing");
+                } else {
+                    // Current roles are written exclusively by the observer as 0..3.
+                    validateProxyScopeRole(entry.first, static_cast<uint32_t>(std::stoul(roles->second)), false);
+                }
+                const auto& decision = m_proxyScopeDecisions.at(entry.first);
+                if (decision.referenceRole == 1) {
+                    decision.hasProxy ? ++projectionProxy : ++projectionDirect;
+                } else if (decision.referenceRole == 2) {
+                    decision.hasProxy ? ++otherProxy : ++otherDirect;
+                }
+            }
+            Log("[PROXY-SCOPE] event=final_summary mode=%u creations=%zu frames=%llu "
+                "projection_proxy_count=%u other_proxy_count=%u projection_direct_count=%u other_direct_count=%u "
+                "strict_scope_comparison=%u reference_complete=%u reason=%s reference_read_only=1\n",
+                m_proxyScopeMode, m_proxyScopeDecisions.size(), static_cast<unsigned long long>(m_proxyUsageFrame),
+                projectionProxy, otherProxy, projectionDirect, otherDirect, m_proxyScopeStrict,
+                m_proxyUsageReference.complete, m_proxyScopeReason.empty() ? "none" : m_proxyScopeReason.c_str());
+        }
+
         template <typename T>
         static void usageField(proxy_usage::Snapshot& snapshot, const std::string& key, T value) {
             snapshot[key] = std::to_string(value);
         }
 
         void writeProxyUsageReference() {
+            if (m_proxyScopeEnabled) return; // The trusted U0 profile is read-only in ALL scope modes.
             // Creation/teardown only: never called in the completion-to-release interval.
             auto temporary = m_proxyUsagePath;
             temporary += fmt::format(".{}.tmp", GetCurrentProcessId());
@@ -4389,7 +4545,7 @@ namespace {
             std::error_code error;
             std::filesystem::create_directories(m_proxyUsagePath.parent_path(), error);
             m_proxyUsageReferenceValid = false;
-            if (m_proxyUsageMode == 1) {
+            if (m_proxyUsageMode == 1 || m_proxyScopeEnabled) {
                 const auto size = std::filesystem::file_size(m_proxyUsagePath, error);
                 if (!error && size <= 4 * 1024 * 1024) {
                     std::ifstream input(m_proxyUsagePath);
@@ -4422,7 +4578,7 @@ namespace {
                 desc.Height, desc.DepthOrArraySize, desc.MipLevels, desc.Format, desc.SampleDesc.Count,
                 desc.SampleDesc.Quality, desc.Layout, desc.Flags);
             const auto prefix = fmt::format("image{}.{}.", index, kind);
-            if (compareResource) {
+            if (compareResource || m_proxyScopeEnabled) {
                 usageField(snapshot, prefix + "Dimension", static_cast<uint32_t>(desc.Dimension));
                 usageField(snapshot, prefix + "Alignment", desc.Alignment);
                 usageField(snapshot, prefix + "Width", desc.Width);
@@ -4444,7 +4600,7 @@ namespace {
                     "VisibleNodeMask=%u HeapFlags=0x%x\n", static_cast<unsigned long long>(identity.id), index,
                     kind, static_cast<unsigned>(heapResult), heap.Type, heap.CPUPageProperty,
                     heap.MemoryPoolPreference, heap.CreationNodeMask, heap.VisibleNodeMask, flags);
-                if (compareResource) {
+                if (compareResource || m_proxyScopeEnabled) {
                     usageField(snapshot, prefix + "HeapType", static_cast<uint32_t>(heap.Type));
                     usageField(snapshot, prefix + "CPUPageProperty", static_cast<uint32_t>(heap.CPUPageProperty));
                     usageField(snapshot, prefix + "MemoryPoolPreference", static_cast<uint32_t>(heap.MemoryPoolPreference));
@@ -4469,7 +4625,7 @@ namespace {
                     static_cast<unsigned long long>(identity.id), index, kind, static_cast<unsigned>(planeResult),
                     desc.Format, formatInfo.PlaneCount, desc.MipLevels, desc.DepthOrArraySize,
                     desc.SampleDesc.Count, desc.SampleDesc.Quality);
-                if (compareResource) {
+                if (compareResource || m_proxyScopeEnabled) {
                     usageField(snapshot, prefix + "PlaneCount", formatInfo.PlaneCount);
                 }
             } else {
@@ -4527,7 +4683,8 @@ namespace {
                     static_cast<unsigned long long>(identity.generation), static_cast<unsigned long long>(identity.id),
                     i, runtime, proxy, identity.hasProxy, initialState);
                 captureProxyUsageResource(runtime, "runtime", identity, swapchain, i, snapshot, false);
-                if (!captureProxyUsageResource(proxy, "proxy", identity, swapchain, i, snapshot, true)) {
+                if (!captureProxyUsageResource(proxy, "proxy", identity, swapchain, i, snapshot, true) &&
+                    (!m_proxyScopeEnabled || identity.hasProxy)) {
                     identity.strict = false;
                     identity.reason = "proxy_heap_or_plane_query_unavailable";
                 }
@@ -4541,7 +4698,9 @@ namespace {
                     identity.reason = "native_CopyResource_precondition_mismatch";
                 }
             }
-            if (m_proxyUsageMode == 1) {
+            if (m_proxyScopeEnabled) {
+                recordProxyScopeCreation(swapchain, original, snapshot, identity);
+            } else if (m_proxyUsageMode == 1) {
                 const auto found = m_proxyUsageReference.swapchains.find(identity.id);
                 if (!m_proxyUsageReferenceValid || found == m_proxyUsageReference.swapchains.end()) {
                     identity.strict = false;
@@ -4670,6 +4829,7 @@ namespace {
             const auto rectText = rect ? xr::ToString(*rect) : "not_applicable";
             const auto binding = fmt::format("{}:{}:{}:{}:{}", role, layer, view, slice, rectText);
             const bool newBinding = identity.roleBindings.size() < 16 && identity.roleBindings.insert(binding).second;
+            if (m_proxyScopeEnabled) validateProxyScopeRole(identity.id, identity.roles, first || newBinding);
             if (first || newBinding) {
                 Log("[PROXY-ROLE] creation_id=%llu swapchain=%p generation=%llu frame=%llu "
                     "use=%s role=%s previous_role=%s first_use=%u role_changed=%u layer=%u view=%u "
@@ -4731,6 +4891,7 @@ namespace {
         }
 
         void finishProxyUsageSession() {
+            if (m_proxyScopeEnabled) finishProxyScopeSession();
             for (const auto& entry : m_proxyUsageSwapchains) summarizeProxyUsage(entry.first);
             std::string reason;
             if (m_proxyUsageMode == 1 && m_proxyUsageReferenceValid) {
@@ -5033,6 +5194,12 @@ namespace {
         uint32_t m_proxyTimingMode{0};
         std::atomic<uint32_t> m_proxyTimingLogs{0};
         bool m_proxyUsageEnabled{false}, m_proxyUsageReferenceValid{false}, m_proxyUsageRunStrict{true};
+        bool m_proxyScopeEnabled{false}, m_proxyScopeStrict{false};
+        uint32_t m_proxyScopeMode{0};
+        std::string m_proxyScopeReason;
+        ID3D12CommandQueue* m_proxyScopeQueue{nullptr};
+        std::map<uint64_t, proxy_scope::Decision> m_proxyScopeDecisions;
+        std::map<uint64_t, uint32_t> m_proxyScopeReleaseLogs;
         uint32_t m_proxyUsageMode{0};
         uint64_t m_proxyUsageCreationId{0}, m_proxyUsageFrame{0};
         std::string m_proxyUsageAppIdentity;
