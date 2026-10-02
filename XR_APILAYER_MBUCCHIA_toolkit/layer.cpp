@@ -363,16 +363,19 @@ namespace {
             m_applicationName = createInfo->applicationInfo.applicationName;
             if (isGraphicsNeutralApp()) {
                 char modeText[8]{};
-                const DWORD modeLength = GetEnvironmentVariableA("OXRTK_PROXY_SYNC_TEST", modeText, sizeof(modeText));
+                const DWORD modeLength = GetEnvironmentVariableA("OXRTK_PROXY_TIMING_TEST", modeText, sizeof(modeText));
                 if (modeLength == 1 && modeText[0] >= '0' && modeText[0] <= '2') {
-                    m_proxySyncMode = static_cast<uint32_t>(modeText[0] - '0');
+                    m_proxyTimingMode = static_cast<uint32_t>(modeText[0] - '0');
                 } else if (modeLength != 0) {
-                    Log("[PROXY-SYNC] app=%s invalid OXRTK_PROXY_SYNC_TEST; using mode=0\n",
+                    Log("[PROXY-TIMING] app=%s invalid OXRTK_PROXY_TIMING_TEST; using mode=0\n",
                         m_applicationName.c_str());
                 }
-                // All modes retain Submode 2's proxy/color/raw-copy path. Old bisect variables
-                // cannot silently select a different pipeline in this diagnostic build.
+                // All modes retain Submode 2's private color proxy and raw CopyResource path.
+                // Synchronization is pinned to Proxy Sync Mode 2 so allocator lifetime and current-copy
+                // completion are identical in every timing mode. Only copy/release timing is varied.
+                m_proxyTimingEnabled = true;
                 m_proxySyncEnabled = true;
+                m_proxySyncMode = 2;
                 m_gfxSubBisectMode = 2;
                 m_gfxBisectMode = 2;
             }
@@ -1013,12 +1016,15 @@ namespace {
                                                                     true /* forceDisableInterceptor */);
                         if (m_proxySyncEnabled) {
                             m_bisectDevice->configureProxySyncDiagnostic(m_proxySyncMode, d3d12Bindings->queue);
-                            m_proxySyncReleaseLogs = 0;
-                            Log("[PROXY-SYNC] app=%s mode=%u base_submode=2 slots=32 "
-                                "allocator_safe=%u wait_current_copy=%u copy_point=release "
-                                "depth=direct overlays=0 postprocess=0 interceptor=0 analyzer=0\n",
-                                m_applicationName.c_str(), m_proxySyncMode, m_proxySyncMode > 0,
-                                m_proxySyncMode == 2);
+                            m_proxyTimingLogs = 0;
+                            m_proxyTimingFrame = 0;
+                            const char* copyPoint = m_proxyTimingMode == 2 ? "endFrame" : "release";
+                            const char* runtimeReleasePoint = m_proxyTimingMode == 0 ? "release" : "endFrame";
+                            Log("[PROXY-TIMING] app=%s mode=%u base_submode=2 sync_mode=%u slots=32 "
+                                "allocator_safe=1 wait_current_copy=1 copy_point=%s runtime_release_point=%s "
+                                "color=proxy depth=direct overlays=0 postprocess=0 interceptor=0 analyzer=0\n",
+                                m_applicationName.c_str(), m_proxyTimingMode, m_proxySyncMode,
+                                copyPoint, runtimeReleasePoint);
                         }
                     }
                     m_metroGraphicsSession = *session;
@@ -1409,6 +1415,9 @@ namespace {
                 m_metroSwapchainIndices.clear();
                 m_subPendingDirectRelease.clear();
                 m_subProxySwapchains.clear();
+                m_subProxyCopyCompleted.clear();
+                m_proxyTimingPendingOrder.clear();
+                m_proxyTimingCopies.clear();
                 m_metroGraphicsSession = XR_NULL_HANDLE;
             }
 
@@ -1515,6 +1524,7 @@ namespace {
                     }
                     m_swapchains.insert_or_assign(*swapchain, std::move(state));
                     m_subProxySwapchains.insert_or_assign(*swapchain, !isDepth);
+                    m_subProxyCopyCompleted.insert_or_assign(*swapchain, false);
                     Log("[GFX-SUBBISECT] create app=%s submode=%u swapchain=%p requested=%ux%u "
                         "arraySize=%u format=%lld sampleCount=%u usageFlags=0x%llx images=%u proxy=%u\n",
                         m_applicationName.c_str(), m_gfxSubBisectMode, *swapchain, createInfo->width,
@@ -1745,6 +1755,10 @@ namespace {
             if (XR_SUCCEEDED(result)) {
                 m_swapchains.erase(swapchain);
                 m_subProxySwapchains.erase(swapchain);
+                m_subProxyCopyCompleted.erase(swapchain);
+                m_proxyTimingCopies.erase(swapchain);
+                m_proxyTimingPendingOrder.erase(std::remove(m_proxyTimingPendingOrder.begin(),
+                    m_proxyTimingPendingOrder.end(), swapchain), m_proxyTimingPendingOrder.end());
                 m_subPendingDirectRelease.erase(swapchain);
                 if (m_metroSwapchainIndices.erase(swapchain)) {
                     Log("[GFX-NEUTRAL] destroy swapchain=%p result=%s\n", swapchain, xr::ToCString(result));
@@ -2142,6 +2156,15 @@ namespace {
                 // Record the index so we know which texture to use in xrEndFrame().
                 if (swapchainIt != m_swapchains.end()) {
                     swapchainIt->second.acquiredImageIndex = *index;
+                    if (m_proxyTimingEnabled && m_subProxySwapchains.count(swapchain) &&
+                        m_proxyTimingLogs.fetch_add(1) < 192) {
+                        const auto& image = swapchainIt->second.images.at(*index);
+                        Log("[PROXY-TIMING] mode=%u event=acquire frame=%llu swapchain=%p kind=%s "
+                            "runtime_index=%u proxy_index=%u proxy_resource=%p runtime_resource=%p\n",
+                            m_proxyTimingMode, static_cast<unsigned long long>(m_proxyTimingFrame), swapchain,
+                            m_subProxySwapchains.at(swapchain) ? "color" : "depth", *index, *index,
+                            image.appTexture->getNativePtr(), image.runtimeTexture->getNativePtr());
+                    }
                     if (m_subProxySwapchains.count(swapchain) &&
                         m_metroGfxAcquireLogs.fetch_add(1) < MetroGfxLogSamples) {
                         Log("[GFX-SUBBISECT] app=%s submode=%u acquire swapchain=%p "
@@ -2197,6 +2220,30 @@ namespace {
             auto swapchainIt = m_swapchains.find(swapchain);
             if (swapchainIt != m_swapchains.end()) {
                 if (m_subProxySwapchains.count(swapchain)) {
+                    if (m_proxyTimingEnabled) {
+                        const bool hasProxy = m_subProxySwapchains.at(swapchain);
+                        if (swapchainIt->second.delayedRelease) {
+                            return XR_ERROR_CALL_ORDER_INVALID;
+                        }
+                        if (m_proxyTimingMode == 0) {
+                            return releaseSubProxyImage(swapchain, "release", releaseInfo);
+                        }
+                        if (m_proxyTimingMode == 1 && hasProxy) {
+                            copySubProxyImage(swapchain, "release");
+                            logProxyTimingCopy(swapchain, "release");
+                        }
+                        swapchainIt->second.delayedRelease = true;
+                        m_proxyTimingPendingOrder.push_back(swapchain);
+                        if (m_proxyTimingLogs.fetch_add(1) < 192) {
+                            Log("[PROXY-TIMING] app=%s mode=%u event=release_deferred point=release "
+                                "swapchain=%p kind=%s image_index=%u copy_done=%u "
+                                "downstream_release=endFrame result=XR_SUCCESS\n",
+                                m_applicationName.c_str(), m_proxyTimingMode, swapchain,
+                                hasProxy ? "color" : "depth", swapchainIt->second.acquiredImageIndex,
+                                m_subProxyCopyCompleted[swapchain]);
+                        }
+                        return XR_SUCCESS;
+                    }
                     if (m_gfxSubBisectMode == 2) {
                         return releaseSubProxyImage(swapchain, "release", releaseInfo);
                     }
@@ -3026,6 +3073,11 @@ namespace {
                     }
                 }
             }
+            if (m_proxyTimingEnabled) {
+                while (!m_proxyTimingPendingOrder.empty()) {
+                    CHECK_XRCMD(releaseSubProxyImage(m_proxyTimingPendingOrder.front(), "beginFrame"));
+                }
+            }
             for (auto& swapchain : m_swapchains) {
                 if (swapchain.second.delayedRelease) {
                     TraceLoggingWrite(g_traceProvider, "ForcedSwapchainRelease", TLPArg(swapchain.first, "Swapchain"));
@@ -3387,6 +3439,11 @@ namespace {
                             CHECK_XRCMD(releaseSubDirectImage(pending.first, "endFrame"));
                         }
                     }
+                } else if (m_proxyTimingEnabled && m_proxyTimingMode > 0) {
+                    // Successful releases remove the front entry; failures keep it pending.
+                    while (!m_proxyTimingPendingOrder.empty()) {
+                        CHECK_XRCMD(releaseSubProxyImage(m_proxyTimingPendingOrder.front(), "endFrame"));
+                    }
                 } else if (m_gfxSubBisectMode == 3) {
                     for (const auto& state : m_subProxySwapchains) {
                         if (m_swapchains.at(state.first).delayedRelease) {
@@ -3425,7 +3482,16 @@ namespace {
                         }
                     }
                 }
+                const auto endFrameEnterTick = GetTickCount64();
                 const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
+                if (m_proxyTimingEnabled && m_proxyTimingLogs.fetch_add(1) < 192) {
+                    Log("[PROXY-TIMING] mode=%u event=xrEndFrame frame=%llu enter_tick=%llu "
+                        "return_tick=%llu pending=%u result=%s\n", m_proxyTimingMode,
+                        static_cast<unsigned long long>(m_proxyTimingFrame++),
+                        static_cast<unsigned long long>(endFrameEnterTick),
+                        static_cast<unsigned long long>(GetTickCount64()),
+                        static_cast<unsigned>(m_proxyTimingPendingOrder.size()), xr::ToCString(result));
+                }
                 if (sample < MetroGfxLogSamples) {
                     Log("[GFX-NEUTRAL] end_result sample=%u result=%s submitted_layers=%u "
                         "extra_copy_or_sync=%u\n", sample, xr::ToCString(result),
@@ -4264,91 +4330,127 @@ namespace {
             return result;
         }
 
+        graphics::ProxySyncSubmission copySubProxyImage(XrSwapchain swapchain, const char* point) {
+            auto& state = m_swapchains.at(swapchain);
+            const uint32_t imageIndex = state.acquiredImageIndex;
+            const bool hasProxy = m_subProxySwapchains.at(swapchain);
+            if (!hasProxy) {
+                return {};
+            }
+
+            auto& images = state.images.at(imageIndex);
+            const auto sourceBefore = images.appTexture->getTrackedStateForDiagnostics();
+            const auto destinationBefore = images.runtimeTexture->getTrackedStateForDiagnostics();
+
+            // Allocate diagnostic storage before GPU submission, never in the completion-to-release interval.
+            auto& diagnostic = m_proxyTimingCopies[swapchain];
+            const auto copyBeginTick = GetTickCount64();
+            // CopyResource covers every mip and array slice. The sync diagnostic is pinned to Mode 2:
+            // safe allocator reuse plus verified completion of this copy before this helper returns.
+            images.appTexture->pushState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+            images.runtimeTexture->pushState(D3D12_RESOURCE_STATE_COPY_DEST);
+            m_bisectDevice->getContextAs<graphics::D3D12>()->CopyResource(
+                images.runtimeTexture->getAs<graphics::D3D12>(),
+                images.appTexture->getAs<graphics::D3D12>());
+            images.runtimeTexture->popState();
+            images.appTexture->popState();
+            const auto submission = m_bisectDevice->flushProxySyncCopy();
+            m_subProxyCopyCompleted[swapchain] = true;
+
+            diagnostic = {submission, sourceBefore, destinationBefore,
+                copyBeginTick, GetTickCount64()};
+            return submission;
+        }
+
+        void logProxyTimingCopy(XrSwapchain swapchain, const char* point) {
+            const auto& state = m_swapchains.at(swapchain);
+            const auto imageIndex = state.acquiredImageIndex;
+            const auto& images = state.images.at(imageIndex);
+            const auto& diagnostic = m_proxyTimingCopies.at(swapchain);
+            const auto& submission = diagnostic.submission;
+            const auto sourceBefore = diagnostic.sourceBefore;
+            const auto destinationBefore = diagnostic.destinationBefore;
+            if (m_proxyTimingLogs.fetch_add(1) < 192) {
+                const auto& slot = submission.submittedSlot;
+                Log("[PROXY-TIMING] app=%s mode=%u event=copy point=%s swapchain=%p kind=color "
+                    "proxy_resource=%p runtime_resource=%p proxy_index=%u runtime_index=%u arraySize=%u "
+                    "state_source_before=0x%x state_source_after=0x%x "
+                    "state_destination_before=0x%x state_destination_after=0x%x barriers=%u "
+                    "slot=%u queue=%p binding_queue=%p queues_match=%u current_fence=%llu "
+                    "copy_wait=%u copy_wait_ms=%.3f completed_before_wait=%llu completed_after_wait=%llu "
+                    "completion_verified=%u frame=%llu copy_begin_tick=%llu completion_tick=%llu "
+                    "states=wrapper_tracked fence_wait_point=same_as_copy result=XR_SUCCESS\n",
+                    m_applicationName.c_str(), m_proxyTimingMode, point, swapchain,
+                    images.appTexture->getNativePtr(), images.runtimeTexture->getNativePtr(), imageIndex, imageIndex,
+                    state.requestedArraySize, sourceBefore, images.appTexture->getTrackedStateForDiagnostics(),
+                    destinationBefore, images.runtimeTexture->getTrackedStateForDiagnostics(),
+                    2u * ((sourceBefore != D3D12_RESOURCE_STATE_COPY_SOURCE) +
+                          (destinationBefore != D3D12_RESOURCE_STATE_COPY_DEST)),
+                    slot.slot, submission.queue, submission.bindingQueue,
+                    submission.queue == submission.bindingQueue,
+                    static_cast<unsigned long long>(submission.submissionFence), submission.copyWaited,
+                    submission.copyWaitMs, static_cast<unsigned long long>(submission.completedBeforeCopyWait),
+                    static_cast<unsigned long long>(submission.completedAfterCopyWait),
+                    submission.completedAfterCopyWait >= submission.submissionFence,
+                    static_cast<unsigned long long>(m_proxyTimingFrame),
+                    static_cast<unsigned long long>(diagnostic.copyBeginTick),
+                    static_cast<unsigned long long>(diagnostic.completionTick));
+            }
+        }
+
         XrResult releaseSubProxyImage(XrSwapchain swapchain, const char* point,
                                       const XrSwapchainImageReleaseInfo* originalInfo = nullptr) {
             auto& state = m_swapchains.at(swapchain);
             const uint32_t imageIndex = state.acquiredImageIndex;
             const bool hasProxy = m_subProxySwapchains.at(swapchain);
-            graphics::ProxySyncSubmission submission;
-            auto& images = state.images.at(imageIndex);
-            const auto sourceBefore = m_proxySyncEnabled ? images.appTexture->getTrackedStateForDiagnostics() :
-                D3D12_RESOURCE_STATE_COMMON;
-            const auto destinationBefore = m_proxySyncEnabled ? images.runtimeTexture->getTrackedStateForDiagnostics() :
-                D3D12_RESOURCE_STATE_COMMON;
-            if (hasProxy) {
-                // CopyResource covers every mip and array slice. ITexture::copyTo() copies only slice zero.
-                images.appTexture->pushState(D3D12_RESOURCE_STATE_COPY_SOURCE);
-                images.runtimeTexture->pushState(D3D12_RESOURCE_STATE_COPY_DEST);
-                m_bisectDevice->getContextAs<graphics::D3D12>()->CopyResource(
-                    images.runtimeTexture->getAs<graphics::D3D12>(),
-                    images.appTexture->getAs<graphics::D3D12>());
-                images.runtimeTexture->popState();
-                images.appTexture->popState();
-                // Submit the copy on the application's queue before telling the runtime the image is ready.
-                if (m_proxySyncEnabled) {
-                    submission = m_bisectDevice->flushProxySyncCopy();
-                } else {
-                    m_bisectDevice->flushContext();
-                }
+            bool copiedNow = false;
+            graphics::ProxySyncSubmission copySubmission;
+
+            if (hasProxy && !m_subProxyCopyCompleted[swapchain]) {
+                copySubmission = copySubProxyImage(swapchain, point);
+                copiedNow = true;
             }
+            const bool copyWasReady = hasProxy && m_subProxyCopyCompleted[swapchain];
+
             XrSwapchainImageReleaseInfo defaultInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            const auto releaseEnterTick = GetTickCount64();
             const XrResult result = OpenXrApi::xrReleaseSwapchainImage(
                 swapchain, originalInfo ? originalInfo : &defaultInfo);
+            // Mode 0 retains the base Mode 2's no-log interval between copy and runtime release.
+            if (copiedNow) {
+                logProxyTimingCopy(swapchain, point);
+            }
             if (XR_SUCCEEDED(result)) {
                 state.delayedRelease = false;
+                m_subProxyCopyCompleted[swapchain] = false;
+                m_proxyTimingPendingOrder.erase(std::remove(m_proxyTimingPendingOrder.begin(),
+                    m_proxyTimingPendingOrder.end(), swapchain), m_proxyTimingPendingOrder.end());
             }
-            if (m_proxySyncEnabled && m_proxySyncReleaseLogs.fetch_add(1) < 128) {
-                // Print only after downstream release; console/file I/O must not become a hidden
-                // pre-release delay. Depth has no submission and never performs a diagnostic wait.
-                Log("[PROXY-SYNC] app=%s mode=%u kind=%s point=%s swapchain=%p "
-                    "proxy_resource=%p runtime_resource=%p proxy_index=%u runtime_index=%u "
-                    "arraySize=%u copy=%u state_source_before=0x%x state_source_after=0x%x "
-                    "state_destination_before=0x%x state_destination_after=0x%x "
-                    "states=wrapper_tracked barriers=%u copy_source=0x%x copy_dest=0x%x "
-                    "release_order=%s result=%s\n",
-                    m_applicationName.c_str(), m_proxySyncMode, hasProxy ? "color" : "depth", point, swapchain,
-                    images.appTexture->getNativePtr(), images.runtimeTexture->getNativePtr(), imageIndex,
-                    imageIndex, state.requestedArraySize, hasProxy, sourceBefore,
-                    images.appTexture->getTrackedStateForDiagnostics(), destinationBefore,
-                    images.runtimeTexture->getTrackedStateForDiagnostics(),
-                    hasProxy ? 2u * ((sourceBefore != D3D12_RESOURCE_STATE_COPY_SOURCE) +
-                                     (destinationBefore != D3D12_RESOURCE_STATE_COPY_DEST)) : 0u,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
-                    !hasProxy ? "direct_release" : m_proxySyncMode == 2 ?
-                        "execute_signal_verify_completion_release" : m_proxySyncMode == 1 ?
-                        "reuse_check_reset_execute_signal_release_no_current_wait" :
-                        "legacy_execute_reset_release_no_signal_no_wait", xr::ToCString(result));
-                if (hasProxy) {
-                    const auto& slot = submission.submittedSlot;
-                    const auto& next = submission.preparedNextSlot;
-                    Log("[PROXY-SYNC] mode=%u slot=%u allocator=%p list=%p queue=%p "
-                        "binding_queue=%p queues_match=%u fence=%p fence_tracking=%u "
-                        "previous_fence=%llu completed_before_reuse=%llu reuse_wait=%u reuse_wait_ms=%.3f "
-                        "execute=1 current_fence=%llu completed_before_copy_wait=%llu "
-                        "copy_wait=%u copy_wait_ms=%.3f completed_after_copy_wait=%llu "
-                        "completed_before_release=%llu completion_required=%u "
-                        "prepared_next_slot=%u next_allocator=%p next_list=%p next_previous_fence=%llu "
-                        "next_completed_before_reuse=%llu next_reuse_wait=%u next_reuse_wait_ms=%.3f "
-                        "next_reset_before_execute=%u\n",
-                        m_proxySyncMode, slot.slot, slot.allocator, slot.commandList, submission.queue,
-                        submission.bindingQueue, submission.queue == submission.bindingQueue, submission.fence,
-                        m_proxySyncMode > 0, static_cast<unsigned long long>(slot.previousFence),
-                        static_cast<unsigned long long>(slot.completedBeforeReuse), slot.waited, slot.waitMs,
-                        static_cast<unsigned long long>(submission.submissionFence),
-                        static_cast<unsigned long long>(submission.completedBeforeCopyWait), submission.copyWaited,
-                        submission.copyWaitMs, static_cast<unsigned long long>(submission.completedAfterCopyWait),
-                        static_cast<unsigned long long>(submission.completedBeforeRelease), m_proxySyncMode == 2,
-                        next.slot, next.allocator, next.commandList, static_cast<unsigned long long>(next.previousFence),
-                        static_cast<unsigned long long>(next.completedBeforeReuse), next.waited, next.waitMs,
-                        m_proxySyncMode > 0);
-                }
+
+            if (m_proxyTimingEnabled && m_proxyTimingLogs.fetch_add(1) < 192) {
+                Log("[PROXY-TIMING] app=%s mode=%u event=downstream_release point=%s "
+                    "swapchain=%p kind=%s image_index=%u copied_now=%u copy_was_ready=%u "
+                    "frame=%llu enter_tick=%llu proxy_index=%u runtime_index=%u proxy_resource=%p "
+                    "runtime_resource=%p state_source=0x%x state_destination=0x%x "
+                    "states=wrapper_tracked barriers_current=%u release_order=%s result=%s\n",
+                    m_applicationName.c_str(), m_proxyTimingMode, point, swapchain,
+                    hasProxy ? "color" : "depth", imageIndex, copiedNow, copyWasReady,
+                    static_cast<unsigned long long>(m_proxyTimingFrame),
+                    static_cast<unsigned long long>(releaseEnterTick), imageIndex, imageIndex,
+                    state.images.at(imageIndex).appTexture->getNativePtr(),
+                    state.images.at(imageIndex).runtimeTexture->getNativePtr(),
+                    state.images.at(imageIndex).appTexture->getTrackedStateForDiagnostics(),
+                    state.images.at(imageIndex).runtimeTexture->getTrackedStateForDiagnostics(), 0u,
+                    std::string_view(point) == "release" ? "app_release" :
+                    std::string_view(point) == "endFrame" ? "before_xrEndFrame" : "forced_before_reuse",
+                    xr::ToCString(result));
             }
             if (m_subReleaseLogs.fetch_add(1) < MetroGfxLogSamples) {
                 Log("[GFX-SUBBISECT] app=%s submode=%u downstream_release point=%s swapchain=%p "
                     "runtime_index=%u proxy_index=%u copy=%u arraySize=%u command_list=%u "
                     "fence_wait=%u result=%s\n", m_applicationName.c_str(), m_gfxSubBisectMode,
                     point, swapchain, imageIndex, imageIndex, hasProxy, state.requestedArraySize,
-                    hasProxy, submission.copyWaited, xr::ToCString(result));
+                    hasProxy && copiedNow, hasProxy && copiedNow && copySubmission.copyWaited, xr::ToCString(result));
             }
             return result;
         }
@@ -4448,12 +4550,25 @@ namespace {
         uint32_t m_gfxSubBisectMode{0};
         bool m_proxySyncEnabled{false};
         uint32_t m_proxySyncMode{0};
-        std::atomic<uint32_t> m_proxySyncReleaseLogs{0};
+        bool m_proxyTimingEnabled{false};
+        uint32_t m_proxyTimingMode{0};
+        std::atomic<uint32_t> m_proxyTimingLogs{0};
         std::shared_ptr<graphics::IDevice> m_bisectDevice;
         XrSession m_metroGraphicsSession{XR_NULL_HANDLE};
         std::map<XrSwapchain, uint32_t> m_metroSwapchainIndices;
         std::map<XrSwapchain, bool> m_subPendingDirectRelease;
         std::map<XrSwapchain, bool> m_subProxySwapchains;
+        std::map<XrSwapchain, bool> m_subProxyCopyCompleted;
+        struct ProxyTimingCopy {
+            graphics::ProxySyncSubmission submission;
+            D3D12_RESOURCE_STATES sourceBefore;
+            D3D12_RESOURCE_STATES destinationBefore;
+            ULONGLONG copyBeginTick;
+            ULONGLONG completionTick;
+        };
+        std::map<XrSwapchain, ProxyTimingCopy> m_proxyTimingCopies;
+        std::vector<XrSwapchain> m_proxyTimingPendingOrder;
+        uint64_t m_proxyTimingFrame{0};
         std::atomic<uint32_t> m_subReleaseLogs{0};
         std::atomic<uint32_t> m_metroGfxEnumerationLogs{0};
         std::atomic<uint32_t> m_metroGfxImageLogs{0};

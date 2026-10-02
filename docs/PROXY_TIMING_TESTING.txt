@@ -1,0 +1,190 @@
+OpenXR Toolkit PSVR2 - Proxy Copy Timing Diagnostic
+===================================================
+Branch: diag/proxy-copy-timing-bisect
+Parent diagnostic branch: diag/proxy-copy-sync-bisect
+Parent published commit: acd28ea578b4171c1ed1fd01eab034513b244431
+Original graphics sub-bisect base: 15533b8e8e79d63daa4894282d75aef75b1e3fc7
+Artifact: OpenXR-Toolkit-PSVR2-ProxyTimingDiag-x64
+This is a diagnostic build, NOT a permanent fix or the public v1.1 release.
+release/v1.1 must remain at 3a6b1084b9761f57e5b18e425753c87d4809023d.
+
+Why this experiment exists
+--------------------------
+The preceding OXRTK_PROXY_SYNC_TEST hardware run on TheMidnightWalk produced:
+Mode 0 unstable, Mode 1 unstable, Mode 2 unstable. Mode 2 verified that the
+current color CopyResource completed before downstream xrReleaseSwapchainImage,
+and allocator/list reuse was fence-safe. Those two synchronization conditions
+were therefore not sufficient to remove the wobble.
+
+This experiment keeps that proven Mode 2 synchronization policy IDENTICAL in
+all modes and varies only when the color copy occurs and when runtime-owned
+swapchain images are actually released downstream.
+
+Scope and controls
+------------------
+Only OpenXR application names Impact and TheMidnightWalk select this diagnostic.
+OXRTK_PROXY_TIMING_TEST is read at process startup: 0, 1 or 2.
+Missing/invalid values select Mode 0.
+
+For these two apps, OXRTK_PROXY_SYNC_TEST, OXRTK_GFX_BISECT and
+OXRTK_GFX_SUBBISECT do not select another path. D3D12 is required.
+
+Every mode uses:
+- runtime-owned XrSwapchain handles;
+- private projection color textures exposed to the app;
+- depth images exposed directly from the runtime;
+- raw D3D12 CopyResource proxy->runtime for color;
+- the same 32-slot command allocator/list ring;
+- allocator lifetime safety from Proxy Sync Mode 2;
+- a same-queue fence Signal and verified completion of every color copy before
+  the copy helper returns;
+- no overlay, postprocess, interceptor or Frame Analyzer;
+- FFR/DFR Off, Crop Off, same FOV and same scene.
+
+Modes and exact ordering
+------------------------
+0 - Unstable control / immediate release
+    App xrReleaseSwapchainImage(color):
+      CopyResource -> submit -> Signal -> verify current copy complete ->
+      downstream xrReleaseSwapchainImage immediately.
+    Depth is released immediately. This reproduces the preceding Proxy Sync
+    Mode 2 control and is expected to wobble.
+
+1 - Copy now, release at xrEndFrame
+    App xrReleaseSwapchainImage(color):
+      CopyResource -> submit -> Signal -> verify current copy complete ->
+      mark release pending; DO NOT call downstream release yet.
+    App xrReleaseSwapchainImage(depth): mark release pending.
+    Immediately before forwarding xrEndFrame, release all pending color/depth
+    images downstream. Color is NOT copied again.
+
+2 - Copy and release at xrEndFrame
+    App xrReleaseSwapchainImage(color/depth): only mark release pending.
+    Immediately before forwarding xrEndFrame, color performs
+      CopyResource -> submit -> Signal -> verify current copy complete -> release.
+    Depth is released in the same end-frame pending-release pass.
+
+Modes 1 and 2 therefore have the same downstream release timing. Their intended
+single discriminant is the color copy timing: app release versus endFrame.
+Mode 0 versus Mode 1 changes downstream release timing while both perform the
+color copy at app release.
+
+Forced-release safety
+---------------------
+If the application tries to acquire a swapchain again, or a new frame begins,
+while a release is still pending, the diagnostic must satisfy the pending
+runtime release first. Mode 1 does not duplicate a color copy that was already
+completed at app release. Mode 2 performs its still-pending color copy before
+that forced release. Logs label these points acquire/beginFrame.
+
+Logging
+-------
+Startup:
+  [PROXY-TIMING] ... mode=N sync_mode=2 allocator_safe=1 wait_current_copy=1
+                       copy_point=release|endFrame runtime_release_point=...
+
+Color copy:
+  [PROXY-TIMING] ... event=copy point=release|endFrame|acquire|beginFrame
+                       current_fence=N completed_after_wait=N
+                       completion_verified=1 queues_match=1
+
+Deferred request:
+  [PROXY-TIMING] ... event=release_deferred ... copy_done=0|1
+
+Actual runtime release:
+  [PROXY-TIMING] ... event=downstream_release point=release|endFrame|...
+                       copied_now=0|1 copy_was_ready=0|1
+
+Expected checks:
+- all modes: startup sync_mode=2, allocator_safe=1, wait_current_copy=1;
+- every color event=copy: completion_verified=1 and queues_match=1;
+- Mode 0 color: copy point=release, downstream_release point=release;
+- Mode 1 color: copy point=release, release_deferred copy_done=1, then
+  downstream_release point=endFrame with copied_now=0;
+- Mode 2 color: release_deferred copy_done=0, then copy point=endFrame followed
+  by downstream_release point=endFrame with copied_now=1.
+
+Interpretation
+--------------
+0 unstable / 1 stable:
+  moving the downstream runtime release to endFrame is strongly implicated.
+  A later bisect should separate color release from depth release/pairing.
+
+0 unstable / 1 unstable / 2 stable:
+  with downstream release timing held constant between Modes 1/2, moving the
+  color proxy->runtime copy itself to endFrame is strongly implicated.
+
+0 / 1 / 2 unstable:
+  copy/release timing is not sufficient. Next investigate the private proxy
+  resource semantics themselves: texture creation flags/properties, app-facing
+  resource identity, descriptor/state assumptions, image-index lifecycle and
+  color/depth pairing.
+
+Do not reinterpret XR_ERROR_CALL_ORDER_INVALID or XR_FRAME_DISCARDED by itself
+as the cause; they have occurred in both stable and unstable historical runs.
+Do not infer that CPU waits are a final fix: they are held constant here only to
+remove synchronization as a confounder.
+
+Controlled launch - Quest 3 / Steam Link
+----------------------------------------
+Before EACH mode, fully exit the game, SteamVR and Steam including tray Steam.
+Open a fresh PowerShell, set the mode, then start Steam FROM THAT POWERSHELL so
+Steam and the SteamVR/game processes inherit the variable. On Quest 3, open
+Steam Link, connect to the PC, let SteamVR start, then launch The Midnight Walk
+from Steam. Keep the same scene and movement for all modes.
+
+Mode 0:
+$env:OXRTK_PROXY_TIMING_TEST = '0'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe
+
+Mode 1:
+$env:OXRTK_PROXY_TIMING_TEST = '1'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe
+
+Mode 2:
+$env:OXRTK_PROXY_TIMING_TEST = '2'
+$steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+Start-Process -FilePath $steamExe
+
+Save the log after each run, before launching the next mode:
+$mode = $env:OXRTK_PROXY_TIMING_TEST
+$log = Join-Path $env:LOCALAPPDATA 'OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log'
+$savedLog = Join-Path ([Environment]::GetFolderPath('Desktop')) "ProxyTiming-Mode$mode.log"
+Copy-Item -LiteralPath $log -Destination $savedLog
+Select-String -LiteralPath $savedLog -Pattern '\[PROXY-TIMING\]'
+
+Audit of supplied inputs and implementation
+------------------------------------------
+The supplied patch applies cleanly to acd28ea578b4171c1ed1fd01eab034513b244431.
+Its resulting tree is 5c95a7802f36e7f2923b36e54d4625949e2e1b31. The supplied
+source ZIP matches all 186 blob files of that tree, with no extra files.
+The base tree equals the original ce87450 proxy-sync diagnostic tree.
+
+Corrections after input audit:
+- Copy logging is emitted AFTER downstream release when copy and release occur
+  together (Mode 0, Mode 2, forced release). No file/console logging is inserted
+  between copy completion and the current runtime release in Mode 0.
+- Pending endFrame/beginFrame releases follow the application's release order,
+  not pointer/map order. Successful release removes the pending entry; failed
+  release keeps both pending state and copy completion for retry without recopy.
+- Logs include acquire indices/resources, frame number, captured copy-start,
+  completion and release-entry ticks, plus downstream xrEndFrame entry/return.
+  Copy and wait records can be printed after release; use captured timestamps
+  and point/frame fields rather than log line emission as the GPU event time.
+- Reacquire or beginFrame forced releases are exceptions to the timing schedule.
+  Frames containing release_order=forced_before_reuse must be excluded from the
+  pure endFrame comparison. Unknown release-info extension chains are not
+  retained by deferred modes; use the normal empty release-info chain for tests.
+- Resource states are wrapper-tracked, not observations of app-side barriers.
+
+Synchronization remains unchanged in d3d12.cpp and interfaces.h from the base.
+Mode 0 equivalence means the same state transitions, raw copy, safe allocator
+flush, current-copy wait, and immediate runtime release; diagnostic bookkeeping
+and post-release log format necessarily differ.
+
+Validation commands from repository root:
+python tests/proxy_sync_ring.py
+python tests/proxy_timing_source.py
+python tests/proxy_timing_lifecycle.py
