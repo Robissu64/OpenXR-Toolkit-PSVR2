@@ -29,6 +29,7 @@
 #include "interfaces.h"
 #include "layer.h"
 #include "log.h"
+#include "swapchain_image_fifo.h"
 
 namespace {
 
@@ -143,6 +144,7 @@ namespace {
     struct SwapchainState {
         std::vector<SwapchainImages> images;
         uint32_t acquiredImageIndex{0};
+        SwapchainImageFifo imageFifo;
         uint32_t requestedWidth{0};
         uint32_t requestedHeight{0};
         uint32_t requestedArraySize{0};
@@ -163,6 +165,14 @@ namespace {
         std::array<uint8_t, 1024> postProcessorBlob;
 
         bool registeredWithFrameAnalyzer{false};
+
+        uint32_t getSubmittedImageIndex() const {
+            const auto index = imageFifo.getSubmittedImageIndex();
+            if (!index) {
+                throw std::runtime_error("Swapchain image has not been released");
+            }
+            return *index;
+        }
     };
 
     class OpenXrLayer : public toolkit::OpenXrApi {
@@ -1870,7 +1880,12 @@ namespace {
             // We remove the timeout causing issues with OpenComposite.
             XrSwapchainImageWaitInfo chainWaitInfo = *waitInfo;
             chainWaitInfo.timeout = XR_INFINITE_DURATION;
-            return OpenXrApi::xrWaitSwapchainImage(swapchain, &chainWaitInfo);
+            const XrResult result = OpenXrApi::xrWaitSwapchainImage(swapchain, &chainWaitInfo);
+            auto swapchainIt = m_swapchains.find(swapchain);
+            if (swapchainIt != m_swapchains.end()) {
+                swapchainIt->second.imageFifo.waited(result);
+            }
+            return result;
         }
 
         XrResult xrAcquireSwapchainImage(XrSwapchain swapchain,
@@ -1893,16 +1908,19 @@ namespace {
                     TraceLoggingWrite(g_traceProvider, "ForcedSwapchainRelease", TLPArg(swapchain, "Swapchain"));
 
                     XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, nullptr};
-                    swapchainIt->second.delayedRelease = false;
-                    CHECK_XRCMD(OpenXrApi::xrReleaseSwapchainImage(swapchain, &releaseInfo));
+                    const XrResult releaseResult = releaseDelayedSwapchainImages(swapchain, &releaseInfo);
+                    if (XR_FAILED(releaseResult)) {
+                        return releaseResult;
+                    }
                 }
             }
 
             const XrResult result = OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
             if (XR_SUCCEEDED(result)) {
-                // Record the index so we know which texture to use in xrEndFrame().
+                // Keep the latest acquire separate from the image released for composition.
                 if (swapchainIt != m_swapchains.end()) {
                     swapchainIt->second.acquiredImageIndex = *index;
+                    swapchainIt->second.imageFifo.acquired(result, *index);
                 }
 
                 TraceLoggingWrite(g_traceProvider, "xrAcquireSwapchainImage", TLArg(*index, "Index"));
@@ -1926,6 +1944,9 @@ namespace {
 
             auto swapchainIt = m_swapchains.find(swapchain);
             if (swapchainIt != m_swapchains.end()) {
+                if (!swapchainIt->second.imageFifo.requestRelease()) {
+                    return XR_ERROR_CALL_ORDER_INVALID;
+                }
                 if (m_frameAnalyzer) {
                     m_frameAnalyzer->onReleaseSwapchain(swapchain);
                 }
@@ -2733,8 +2754,10 @@ namespace {
                     TraceLoggingWrite(g_traceProvider, "ForcedSwapchainRelease", TLPArg(swapchain.first, "Swapchain"));
 
                     XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                    swapchain.second.delayedRelease = false;
-                    CHECK_XRCMD(OpenXrApi::xrReleaseSwapchainImage(swapchain.first, &releaseInfo));
+                    const XrResult releaseResult = releaseDelayedSwapchainImages(swapchain.first, &releaseInfo);
+                    if (XR_FAILED(releaseResult)) {
+                        return releaseResult;
+                    }
                 }
             }
 
@@ -3197,7 +3220,7 @@ namespace {
                             throw std::runtime_error("Swapchain is not registered");
                         }
                         auto& swapchainState = swapchainIt->second;
-                        auto& swapchainImages = swapchainState.images[swapchainState.acquiredImageIndex];
+                        auto& swapchainImages = swapchainState.images[swapchainState.getSubmittedImageIndex()];
                         if (m_cropActive && !swapchainState.cropRecommendationLogged[eye]) {
                             const uint32_t expectedWidth = useDoubleWide
                                                                ? m_cropRecommendedWidth[0] + m_cropRecommendedWidth[1]
@@ -3273,7 +3296,7 @@ namespace {
                                     auto& depthSwapchainState = depthSwapchainIt->second;
 
                                     depthBuffer =
-                                        depthSwapchainState.images[depthSwapchainState.acquiredImageIndex].appTexture;
+                                        depthSwapchainState.images[depthSwapchainState.getSubmittedImageIndex()].appTexture;
                                     nearFar.Near = depth->nearZ;
                                     nearFar.Far = depth->farZ;
 
@@ -3563,7 +3586,7 @@ namespace {
                     }
 
                     auto& swapchainState = swapchainIt->second;
-                    auto& swapchainImages = swapchainState.images[swapchainState.acquiredImageIndex];
+                    auto& swapchainImages = swapchainState.images[swapchainState.getSubmittedImageIndex()];
 
                     if (swapchainImages.appTexture != swapchainImages.runtimeTexture) {
                         swapchainImages.appTexture->copyTo(swapchainImages.runtimeTexture);
@@ -3768,8 +3791,10 @@ namespace {
                     TraceLoggingWrite(g_traceProvider, "DelayedSwapchainRelease", TLPArg(swapchain.first, "Swapchain"));
 
                     XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                    swapchain.second.delayedRelease = false;
-                    CHECK_XRCMD(OpenXrApi::xrReleaseSwapchainImage(swapchain.first, &releaseInfo));
+                    const XrResult releaseResult = releaseDelayedSwapchainImages(swapchain.first, &releaseInfo);
+                    if (XR_FAILED(releaseResult)) {
+                        return releaseResult;
+                    }
                 }
             }
             if (needMenuSwapchainDelayedRelease) {
@@ -3850,6 +3875,26 @@ namespace {
         }
 
       private:
+        XrResult releaseDelayedSwapchainImages(XrSwapchain swapchain,
+                                               const XrSwapchainImageReleaseInfo* releaseInfo) {
+            auto& state = m_swapchains.at(swapchain);
+            if (!state.imageFifo.getReleaseImageIndex()) {
+                return XR_ERROR_CALL_ORDER_INVALID;
+            }
+
+            XrResult result = XR_SUCCESS;
+            // Preserve the existing forwarding points, but account for every app release.
+            while (state.imageFifo.getReleaseImageIndex()) {
+                result = OpenXrApi::xrReleaseSwapchainImage(swapchain, releaseInfo);
+                if (XR_FAILED(result)) {
+                    return result;
+                }
+                state.imageFifo.released(result);
+            }
+            state.delayedRelease = false;
+            return result;
+        }
+
         bool isVrSystem(XrSystemId systemId) const {
             return systemId == m_vrSystemId;
         }
