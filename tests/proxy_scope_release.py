@@ -6,7 +6,7 @@ import ast
 from pathlib import Path
 import subprocess
 import tempfile
-from proxy_usage_source import block
+from proxy_usage_source import block, release_without_index_diagnostic
 
 ROOT=Path(__file__).resolve().parents[1]
 layer=(ROOT/'XR_APILAYER_MBUCCHIA_toolkit/layer.cpp').read_text()
@@ -50,7 +50,7 @@ harness=harness.replace('RECORD',block(layer,'struct ProxyTimingCopy')+';')
 harness=harness.replace('METHODS','\n'.join(block(layer,m) for m in (
     'graphics::ProxySyncSubmission copySubProxyImage','void logProxyTimingCopy','XrResult releaseSubProxyImage')))
 harness=harness.replace('BASEMETHOD',block(base,'XrResult releaseSubProxyImage').replace('releaseSubProxyImage','baseRelease',1))
-harness=harness.replace('APPRELEASE',block(layer[layer.index('XrResult xrReleaseSwapchainImage'):],'if (m_proxyUsageEnabled)'))
+harness=harness.replace('APPRELEASE',release_without_index_diagnostic(layer))
 harness=harness.replace('ENDFRAME',block(layer[layer.index('XrResult xrEndFrame'):],'if (m_proxyTimingEnabled && m_proxyTimingMode > 0)'))
 harness+=r'''
 void setup(Fixture& f,unsigned mode) {

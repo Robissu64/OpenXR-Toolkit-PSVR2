@@ -17,6 +17,19 @@ def block(src, marker):
         end += 1
     return src[start:end]
 
+def release_without_index_diagnostic(layer):
+    """Extract the pre-existing dispatch for legacy GPU mock tests."""
+    release = block(layer[layer.index('XrResult xrReleaseSwapchainImage'):], 'if (m_proxyUsageEnabled)')
+    start = release.index('const auto indexTracker = m_proxyIndexTrackers.find(swapchain);')
+    end = release.index('const bool copiedNow =', start)
+    release = release[:start] + release[end:]
+    start = release.index('if (indexTracker != m_proxyIndexTrackers.end() && m_proxyIndexMode == 1)')
+    end = release.index('if (indexTracker != m_proxyIndexTrackers.end())', start + 1)
+    release = release[:start] + release[end:]
+    start = release.index('if (indexTracker != m_proxyIndexTrackers.end())', release.index('logProxyUsageRelease'))
+    end = start + len(block(release[start:], 'if (indexTracker != m_proxyIndexTrackers.end())'))
+    return release[:start] + release[end:]
+
 relative = 'XR_APILAYER_MBUCCHIA_toolkit/'
 layer = (ROOT / relative / 'layer.cpp').read_text()
 base = blob(relative + 'layer.cpp').decode()
@@ -40,8 +53,14 @@ print('PASS: copy/barriers/submission/wait/runtime release helpers byte-identica
 observer = '                if (m_proxyUsageEnabled) {\n                    observeProxyUsageRoles(frameEndInfo);\n                }\n'
 assert block(layer, 'XrResult xrEndFrame').replace(observer, '') == block(base, 'XrResult xrEndFrame')
 assert block(layer, 'XrResult xrEnumerateSwapchainImages') == block(base, 'XrResult xrEnumerateSwapchainImages')
-assert block(layer, 'XrResult xrWaitSwapchainImage') == block(base, 'XrResult xrWaitSwapchainImage')
-print('PASS: EndFrame changes only by observation; enumeration and wait unchanged')
+wait = block(layer, 'XrResult xrWaitSwapchainImage')
+assert 'const XrResult result = OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);' in wait
+assert wait.index('OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo)') < wait.index('tracker->second.waitSucceeded()')
+assert 'result == XR_SUCCESS || result == XR_SESSION_LOSS_PENDING' in wait
+assert 'result == XR_TIMEOUT_EXPIRED' in wait
+assert 'chainWaitInfo.timeout = XR_INFINITE_DURATION;' in wait
+assert 'return OpenXrApi::xrWaitSwapchainImage(swapchain, &chainWaitInfo);' in wait
+print('PASS: EndFrame and enumeration unchanged; wait forwards original info before diagnostic state update')
 
 startup = block(layer, 'if (isGraphicsNeutralApp())')
 assert 'OXRTK_PROXY_USAGE_TEST' in startup and startup.rindex('m_proxyTimingMode = 0;') > startup.index('OXRTK_PROXY_USAGE_TEST')

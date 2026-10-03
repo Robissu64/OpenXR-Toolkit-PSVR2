@@ -90,7 +90,14 @@ namespace fmt {
 std::filesystem::path localAppData=std::filesystem::current_path()/"mock-appdata";
 constexpr unsigned MOVEFILE_REPLACE_EXISTING=1,MOVEFILE_WRITE_THROUGH=2;
 unsigned GetCurrentProcessId() {return 42;}
-int MoveFileExW(const char* from,const char* to,unsigned) {return std::rename(from,to)==0;}
+int MoveFileExW(const std::filesystem::path::value_type* from,
+                const std::filesystem::path::value_type* to,unsigned) {
+    std::error_code error;
+    std::filesystem::remove(to,error);
+    error.clear();
+    std::filesystem::rename(from,to,error);
+    return !error;
+}
 std::vector<std::string> logs;
 template<class... A> void Log(const char* pattern,const A&...) {logs.push_back(pattern);}
 struct XrRect2Di {struct {int x=0,y=0;} offset;struct {int width=0,height=0;} extent;};

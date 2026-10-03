@@ -21,10 +21,11 @@ on:
       - diag/proxy-copy-timing-bisect
       - diag/proxy-transfer-dst-bisect
       - diag/proxy-scope-bisect
+      - diag/proxy-index-bisect
 
 jobs:
   validate_scope_native:
-    if: github.ref_name == 'diag/proxy-scope-bisect'
+    if: github.ref_name == 'diag/proxy-scope-bisect' || github.ref_name == 'diag/proxy-index-bisect'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +38,12 @@ jobs:
           for test in tests/proxy_sync_ring.py tests/proxy_timing_source.py tests/proxy_timing_lifecycle.py tests/proxy_usage_source.py tests/proxy_usage_diagnostic.py tests/proxy_usage_release.py tests/proxy_scope_source.py tests/proxy_scope_diagnostic.py tests/proxy_scope_release.py; do
             python3 "$test"
           done
+          if [[ "$GITHUB_REF_NAME" == 'diag/proxy-index-bisect' ]]; then
+            python3 tests/proxy_index_source.py
+            g++ -std=c++17 -Wall -Wextra -Werror -I XR_APILAYER_MBUCCHIA_toolkit \
+              tests/proxy_index_diagnostic.cpp -o "$RUNNER_TEMP/proxy_index_diagnostic"
+            "$RUNNER_TEMP/proxy_index_diagnostic"
+          fi
   build:
     needs: validate_scope_native
     if: ${{ !cancelled() && (needs.validate_scope_native.result == 'success' || needs.validate_scope_native.result == 'skipped') }}
@@ -54,10 +61,14 @@ jobs:
         if: github.ref_name == 'diag/proxy-transfer-dst-bisect'
         shell: pwsh
         run: python tests/proxy_usage_source.py
-      - name: Validate proxy scope source invariants
-        if: github.ref_name == 'diag/proxy-scope-bisect'
+      - name: Validate proxy scope and index source invariants
+        if: github.ref_name == 'diag/proxy-scope-bisect' || github.ref_name == 'diag/proxy-index-bisect'
         shell: pwsh
         run: |
+          if ($env:GITHUB_REF_NAME -eq 'diag/proxy-index-bisect') {
+            python tests/proxy_index_source.py
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           python tests/proxy_scope_source.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/proxy_usage_source.py
@@ -119,7 +130,10 @@ jobs:
           $isProxyTimingDiag = $env:GITHUB_REF_NAME -eq 'diag/proxy-copy-timing-bisect'
           $isProxyUsageDiag = $env:GITHUB_REF_NAME -eq 'diag/proxy-transfer-dst-bisect'
           $isProxyScopeDiag = $env:GITHUB_REF_NAME -eq 'diag/proxy-scope-bisect'
-          $release = if ($isProxyScopeDiag) {
+          $isProxyIndexDiag = $env:GITHUB_REF_NAME -eq 'diag/proxy-index-bisect'
+          $release = if ($isProxyIndexDiag) {
+            'release-output/OpenXR-Toolkit-PSVR2-ProxyIndexDiag-x64'
+          } elseif ($isProxyScopeDiag) {
             'release-output/OpenXR-Toolkit-PSVR2-ProxyScopeDiag-x64'
           } elseif ($isProxyUsageDiag) {
             'release-output/OpenXR-Toolkit-PSVR2-ProxyUsageDiag-x64'
@@ -166,8 +180,8 @@ jobs:
             Copy-Item -LiteralPath $source -Destination "$release/shaders"
           }
 
-          $readme = if ($isProxyScopeDiag -or $isProxyUsageDiag -or $isProxyTimingDiag -or $isProxySyncDiag -or $isV11Final -or $isMetroGraphicsDiag -or $isGraphicsNeutral2Games -or $isGraphicsBisect -or $isGraphicsSubBisect) { 'docs/PSVR2_V11_README.md' } elseif ($isV11Rc) { 'docs/PSVR2_V11_RC_README.md' } else { 'docs/PSVR2_V1_README.md' }
-          $notes = if ($isProxyScopeDiag -or $isProxyUsageDiag -or $isProxyTimingDiag -or $isProxySyncDiag -or $isV11Final -or $isMetroGraphicsDiag -or $isGraphicsNeutral2Games -or $isGraphicsBisect -or $isGraphicsSubBisect) { 'docs/RELEASE_NOTES_v1.1.md' } elseif ($isV11Rc) { 'docs/RELEASE_NOTES_v1.1_RC.md' } else { 'docs/RELEASE_NOTES_v1.0.md' }
+          $readme = if ($isProxyIndexDiag -or $isProxyScopeDiag -or $isProxyUsageDiag -or $isProxyTimingDiag -or $isProxySyncDiag -or $isV11Final -or $isMetroGraphicsDiag -or $isGraphicsNeutral2Games -or $isGraphicsBisect -or $isGraphicsSubBisect) { 'docs/PSVR2_V11_README.md' } elseif ($isV11Rc) { 'docs/PSVR2_V11_RC_README.md' } else { 'docs/PSVR2_V1_README.md' }
+          $notes = if ($isProxyIndexDiag -or $isProxyScopeDiag -or $isProxyUsageDiag -or $isProxyTimingDiag -or $isProxySyncDiag -or $isV11Final -or $isMetroGraphicsDiag -or $isGraphicsNeutral2Games -or $isGraphicsBisect -or $isGraphicsSubBisect) { 'docs/RELEASE_NOTES_v1.1.md' } elseif ($isV11Rc) { 'docs/RELEASE_NOTES_v1.1_RC.md' } else { 'docs/RELEASE_NOTES_v1.0.md' }
           Copy-Item -LiteralPath $readme -Destination "$release/README.md"
           Copy-Item -LiteralPath $notes -Destination "$release/RELEASE_NOTES.md"
           if ($isGraphicsBisect) {
@@ -188,6 +202,10 @@ jobs:
           if ($isProxyScopeDiag) {
             Copy-Item -LiteralPath 'docs/PROXY_SCOPE_TESTING.txt' -Destination "$release/PROXY_SCOPE_TESTING.txt"
           }
+          if ($isProxyIndexDiag) {
+            Copy-Item -LiteralPath 'docs/PROXY_INDEX_TESTING.txt' -Destination "$release/PROXY_INDEX_TESTING.txt"
+            Copy-Item -LiteralPath 'docs/PROXY_SCOPE_TESTING.txt' -Destination "$release/PROXY_SCOPE_TESTING.txt"
+          }
           Copy-Item -LiteralPath 'scripts/Install.bat' -Destination $release
           Copy-Item -LiteralPath 'scripts/Uninstall.bat' -Destination $release
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
@@ -201,6 +219,6 @@ jobs:
           Get-FileHash 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64/XR_APILAYER_MBUCCHIA_toolkit.dll' -Algorithm SHA256
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_name == 'diag/proxy-scope-bisect' && 'OpenXR-Toolkit-PSVR2-ProxyScopeDiag-x64' || github.ref_name == 'diag/proxy-transfer-dst-bisect' && 'OpenXR-Toolkit-PSVR2-ProxyUsageDiag-x64' || github.ref_name == 'diag/proxy-copy-timing-bisect' && 'OpenXR-Toolkit-PSVR2-ProxyTimingDiag-x64' || github.ref_name == 'diag/proxy-copy-sync-bisect' && 'OpenXR-Toolkit-PSVR2-ProxySyncDiag-x64' || github.ref_name == 'diag/graphics-path-sub-bisect' && 'OpenXR-Toolkit-PSVR2-GraphicsSubBisect-x64' || github.ref_name == 'diag/graphics-path-bisect' && 'OpenXR-Toolkit-PSVR2-GraphicsBisect-x64' || github.ref_name == 'diag/graphics-neutral-two-games' && 'OpenXR-Toolkit-PSVR2-GraphicsNeutral2Games-x64' || github.ref_name == 'diag/metro-graphics-neutral' && 'OpenXR-Toolkit-PSVR2-MetroGraphicsDiag-x64' || github.ref_name == 'release/v1.1' && 'OpenXR-Toolkit-PSVR2-v1.1-x64' || github.ref_name == 'release/v1.1-rc' && 'OpenXR-Toolkit-PSVR2-v1.1-RC-x64' || github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
+          name: ${{ github.ref_name == 'diag/proxy-index-bisect' && 'OpenXR-Toolkit-PSVR2-ProxyIndexDiag-x64' || github.ref_name == 'diag/proxy-scope-bisect' && 'OpenXR-Toolkit-PSVR2-ProxyScopeDiag-x64' || github.ref_name == 'diag/proxy-transfer-dst-bisect' && 'OpenXR-Toolkit-PSVR2-ProxyUsageDiag-x64' || github.ref_name == 'diag/proxy-copy-timing-bisect' && 'OpenXR-Toolkit-PSVR2-ProxyTimingDiag-x64' || github.ref_name == 'diag/proxy-copy-sync-bisect' && 'OpenXR-Toolkit-PSVR2-ProxySyncDiag-x64' || github.ref_name == 'diag/graphics-path-sub-bisect' && 'OpenXR-Toolkit-PSVR2-GraphicsSubBisect-x64' || github.ref_name == 'diag/graphics-path-bisect' && 'OpenXR-Toolkit-PSVR2-GraphicsBisect-x64' || github.ref_name == 'diag/graphics-neutral-two-games' && 'OpenXR-Toolkit-PSVR2-GraphicsNeutral2Games-x64' || github.ref_name == 'diag/metro-graphics-neutral' && 'OpenXR-Toolkit-PSVR2-MetroGraphicsDiag-x64' || github.ref_name == 'release/v1.1' && 'OpenXR-Toolkit-PSVR2-v1.1-x64' || github.ref_name == 'release/v1.1-rc' && 'OpenXR-Toolkit-PSVR2-v1.1-RC-x64' || github.ref_name == 'fix/native-openxr-app-owned-eye-extension' && 'OpenXR-Toolkit-PSVR2-HubrisEyeBindingFix-x64' || 'OpenXR-Toolkit-PSVR2-v1.0-x64' }}
           path: ${{ github.ref_name == 'release/v1.1' && 'release-output/OpenXR-Toolkit-PSVR2-v1.1-x64.zip' || 'release-output/OpenXR-Toolkit-PSVR2-*/' }}
           if-no-files-found: error

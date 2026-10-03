@@ -1,0 +1,74 @@
+OpenXR Toolkit PSVR2 - Proxy Image Index Experiment
+
+Only Impact and TheMidnightWalk on D3D12. This experiment requires
+OXRTK_PROXY_SCOPE_TEST=1 and a valid persisted U0 reference described in
+PROXY_SCOPE_TESTING.txt. Projection color alone remains proxied; depth and
+auxiliary swapchains remain direct. Do not delete or regenerate the U0 file.
+
+OXRTK_PROXY_INDEX_TEST=0 (or unset/invalid): legacy last-acquired copy index.
+OXRTK_PROXY_INDEX_TEST=1: oldest acquired and successfully waited FIFO index.
+Both modes use the same existing proxy resource, CopyResource, barriers,
+command queue, allocator-safe ring, fence wait and immediate downstream
+release at application xrReleaseSwapchainImage.
+
+Fully close the game, SteamVR and Steam before EACH run. Install the locally
+reviewed diagnostic DLL first. Keep the game scene and settings constant.
+Run each command block in a new PowerShell window, then observe headset wobble.
+Start Steam and SteamVR only AFTER setting the user-level variables, so both
+processes inherit them. For The Midnight Walk, start the external executable
+from that same PowerShell window after Steam and SteamVR are running.
+
+Metro Awakening / Impact, control mode 0:
+
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST','1','User')
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_INDEX_TEST','0','User')
+    $env:OXRTK_PROXY_SCOPE_TEST = '1'
+    $env:OXRTK_PROXY_INDEX_TEST = '0'
+    $steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+    Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+
+Metro Awakening / Impact, FIFO mode 1:
+
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST','1','User')
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_INDEX_TEST','1','User')
+    $env:OXRTK_PROXY_SCOPE_TEST = '1'
+    $env:OXRTK_PROXY_INDEX_TEST = '1'
+    $steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+    Start-Process -FilePath $steamExe -ArgumentList '-applaunch 2669410'
+
+The Midnight Walk, control mode 0:
+
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST','1','User')
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_INDEX_TEST','0','User')
+    $env:OXRTK_PROXY_SCOPE_TEST = '1'
+    $env:OXRTK_PROXY_INDEX_TEST = '0'
+    $steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+    Start-Process -FilePath $steamExe
+    # Once Steam and SteamVR are running with these variables:
+    Start-Process -FilePath 'D:\Games\The Midnight Walk\TheMidnightWalk.exe' -ArgumentList '-vr','XRSystem'
+
+The Midnight Walk, FIFO mode 1:
+
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST','1','User')
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_INDEX_TEST','1','User')
+    $env:OXRTK_PROXY_SCOPE_TEST = '1'
+    $env:OXRTK_PROXY_INDEX_TEST = '1'
+    $steamExe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamExe
+    Start-Process -FilePath $steamExe
+    # Once Steam and SteamVR are running with these variables:
+    Start-Process -FilePath 'D:\Games\The Midnight Walk\TheMidnightWalk.exe' -ArgumentList '-vr','XRSystem'
+
+Log: %LOCALAPPDATA%\OpenXR-Toolkit\logs\XR_APILAYER_MBUCCHIA_toolkit.log
+Look for [PROXY-INDEX] event=release and final_summary. In mode 0, mismatch=1
+shows where the old copy index differs from the FIFO release target. In mode 1,
+selected_copy_index must equal oldest_acquired_index and oldest_waited_index.
+Only compare wobble when strict_comparison=1, fifo_errors=0 and the scope
+diagnostic also reports strict_scope_comparison=1. A timeout must leave its
+entry in the queue; any invalid order marks the comparison invalid.
+pending_at_destroy and pending_at_session_end are teardown observations, not
+FIFO errors. A final outstanding acquisition can be normal for this game.
+
+After testing:
+
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_INDEX_TEST',$null,'User')
+    [Environment]::SetEnvironmentVariable('OXRTK_PROXY_SCOPE_TEST',$null,'User')

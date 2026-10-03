@@ -31,6 +31,7 @@
 #include "log.h"
 #include "proxy_usage_diagnostic.h"
 #include "proxy_scope_diagnostic.h"
+#include "proxy_index_diagnostic.h"
 
 namespace {
 
@@ -405,6 +406,13 @@ namespace {
                 const auto scopeLength = GetEnvironmentVariableA("OXRTK_PROXY_SCOPE_TEST", scopeText, sizeof(scopeText));
                 m_proxyScopeEnabled = true;
                 m_proxyScopeMode = proxy_scope::ParseMode(scopeText, scopeLength);
+                char indexText[8]{};
+                const DWORD indexLength = GetEnvironmentVariableA("OXRTK_PROXY_INDEX_TEST", indexText, sizeof(indexText));
+                m_proxyIndexMode = indexLength == 1 && indexText[0] == '1' ? 1u : 0u;
+                m_proxyIndexEnabled = m_proxyScopeMode == 1;
+                Log("[PROXY-INDEX] app=%s mode=%u active=%u scope_mode=%u reason=%s\n",
+                    m_applicationName.c_str(), m_proxyIndexMode, m_proxyIndexEnabled, m_proxyScopeMode,
+                    m_proxyIndexEnabled ? "projection_proxy_only" : "requires_OXRTK_PROXY_SCOPE_TEST_1");
                 m_proxyUsageMode = 0; // Usage/timing/sync/graphics environment variables cannot vary scope.
                 m_proxyTimingMode = 0;
                 Log("[PROXY-SCOPE] app=%s mode=%u usage=original copy_point=release "
@@ -1044,6 +1052,7 @@ namespace {
                         m_proxySyncEnabled = false;
                         m_proxyUsageEnabled = false;
                         m_proxyScopeEnabled = false;
+                        m_proxyIndexEnabled = false;
                         Log("[PROXY-USAGE] unsupported reason=D3D12_binding_required\n");
                     }
                     if (m_gfxBisectMode > 0) {
@@ -1067,6 +1076,16 @@ namespace {
                         }
                     }
                     m_metroGraphicsSession = *session;
+                    if (m_proxyIndexEnabled) {
+                        m_proxyIndexTrackers.clear();
+                        m_proxyIndexStrict = true;
+                        m_proxyIndexReason.clear();
+                        m_proxyIndexAcquireCount = m_proxyIndexSuccessfulWaitCount = m_proxyIndexTimeoutCount = 0;
+                        m_proxyIndexReleaseCount = m_proxyIndexLegacyMismatchCount = m_proxyIndexFifoErrors = 0;
+                        m_proxyIndexPendingAtDestroy = 0;
+                        m_proxyIndexAcquireLogs = m_proxyIndexWaitLogs = m_proxyIndexReleaseLogs = 0;
+                        m_proxyIndexErrorLogs = m_proxyIndexTeardownLogs = 0;
+                    }
                     if (m_proxyUsageEnabled && d3d12Bindings) {
                         beginProxyUsageSession(*session, d3d12Bindings->device);
                         if (m_proxyScopeEnabled) beginProxyScopeSession(d3d12Bindings->queue);
@@ -1449,6 +1468,7 @@ namespace {
                 if (m_proxyUsageEnabled) {
                     finishProxyUsageSession();
                 }
+                if (m_proxyIndexEnabled) finishProxyIndexSession();
                 m_swapchains.clear();
                 if (m_bisectDevice) {
                     // Keep the D3D12 wrapper alive until its diagnostic textures have been released.
@@ -1461,6 +1481,7 @@ namespace {
                 m_metroSwapchainIndices.clear();
                 m_subPendingDirectRelease.clear();
                 m_subProxySwapchains.clear();
+                m_proxyIndexTrackers.clear();
                 m_subProxyCopyCompleted.clear();
                 m_proxyTimingPendingOrder.clear();
                 m_proxyTimingCopies.clear();
@@ -1583,6 +1604,8 @@ namespace {
                     }
                     m_swapchains.insert_or_assign(*swapchain, std::move(state));
                     m_subProxySwapchains.insert_or_assign(*swapchain, hasProxy);
+                    if (m_proxyIndexEnabled && hasProxy && scope.strict && scope.referenceRole == 1)
+                        m_proxyIndexTrackers.emplace(*swapchain, proxy_index::Tracker{});
                     m_subProxyCopyCompleted.insert_or_assign(*swapchain, false);
                     if (m_proxyUsageEnabled) {
                         if (m_proxyScopeEnabled) {
@@ -1824,6 +1847,16 @@ namespace {
                 }
                 m_swapchains.erase(swapchain);
                 m_subProxySwapchains.erase(swapchain);
+                auto indexTracker = m_proxyIndexTrackers.find(swapchain);
+                if (indexTracker != m_proxyIndexTrackers.end()) {
+                    const size_t pending = indexTracker->second.queue.size();
+                    m_proxyIndexPendingAtDestroy += pending;
+                    if (pending && m_proxyIndexTeardownLogs++ < 8) {
+                        Log("[PROXY-INDEX] event=destroy swapchain=%p pending=%zu queue=%s "
+                            "teardown_only=1\n", swapchain, pending, indexTracker->second.state().c_str());
+                    }
+                    m_proxyIndexTrackers.erase(indexTracker);
+                }
                 m_subProxyCopyCompleted.erase(swapchain);
                 m_proxyTimingCopies.erase(swapchain);
                 m_proxyTimingPendingOrder.erase(std::remove(m_proxyTimingPendingOrder.begin(),
@@ -2160,6 +2193,26 @@ namespace {
 
             if (m_metroSwapchainIndices.count(swapchain) || m_subProxySwapchains.count(swapchain)) {
                 const XrResult result = OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);
+                if (auto tracker = m_proxyIndexTrackers.find(swapchain); tracker != m_proxyIndexTrackers.end()) {
+                    const auto* target = tracker->second.waitTarget();
+                    const uint32_t targetIndex = target ? target->index : UINT32_MAX;
+                    const bool waitedSuccessfully = result == XR_SUCCESS || result == XR_SESSION_LOSS_PENDING;
+                    if (waitedSuccessfully) {
+                        ++m_proxyIndexSuccessfulWaitCount;
+                        if (!tracker->second.waitSucceeded()) invalidateProxyIndex(tracker->second.error.c_str());
+                    } else if (result == XR_TIMEOUT_EXPIRED) {
+                        ++m_proxyIndexTimeoutCount;
+                        if (!target) invalidateProxyIndex("timeout_without_unwaited_image");
+                    } else if (XR_FAILED(result)) {
+                        invalidateProxyIndex("downstream_wait_failed");
+                    }
+                    if (m_proxyIndexWaitLogs++ < 48) {
+                        Log("[PROXY-INDEX] event=wait swapchain=%p wait_target_index=%u wait_result=%s "
+                            "waited_successfully=%u queue_depth=%zu queue=%s\n", swapchain, targetIndex,
+                            xr::ToCString(result), waitedSuccessfully, tracker->second.queue.size(),
+                            tracker->second.state().c_str());
+                    }
+                }
                 if (m_metroGfxWaitLogs.fetch_add(1) < MetroGfxLogSamples) {
                     Log("[GFX-NEUTRAL] wait swapchain=%p timeout_requested=%lld timeout_forwarded=%lld "
                         "result=%s toolkit_queue_wait=0 toolkit_fence=0\n",
@@ -2225,6 +2278,16 @@ namespace {
                 // Record the index so we know which texture to use in xrEndFrame().
                 if (swapchainIt != m_swapchains.end()) {
                     swapchainIt->second.acquiredImageIndex = *index;
+                    if (auto tracker = m_proxyIndexTrackers.find(swapchain); tracker != m_proxyIndexTrackers.end()) {
+                        ++m_proxyIndexAcquireCount;
+                        if (!tracker->second.acquire(*index, static_cast<uint32_t>(swapchainIt->second.images.size())))
+                            invalidateProxyIndex(tracker->second.error.c_str());
+                        if (m_proxyIndexAcquireLogs++ < 48) {
+                            Log("[PROXY-INDEX] event=acquire swapchain=%p returned_index=%u queue_depth=%zu "
+                                "queue=%s\n", swapchain, *index, tracker->second.queue.size(),
+                                tracker->second.state().c_str());
+                        }
+                    }
                     if (m_proxyUsageEnabled) {
                         logProxyUsageAcquire(swapchain, *index);
                     }
@@ -2252,6 +2315,8 @@ namespace {
                 if (m_graphicsDevice) {
                     m_graphicsDevice->executeDebugWorkload();
                 }
+            } else if (XR_FAILED(result) && m_proxyIndexTrackers.count(swapchain)) {
+                invalidateProxyIndex("downstream_acquire_failed");
             }
 
             return result;
@@ -2296,11 +2361,61 @@ namespace {
                         if (swapchainIt->second.delayedRelease) {
                             return XR_ERROR_CALL_ORDER_INVALID;
                         }
+                        const auto indexTracker = m_proxyIndexTrackers.find(swapchain);
+                        const uint32_t legacyIndex = indexTracker == m_proxyIndexTrackers.end() ?
+                            swapchainIt->second.acquiredImageIndex : indexTracker->second.lastAcquiredIndex;
+                        uint32_t selectedCopyIndex = legacyIndex;
+                        uint32_t fifoIndex = UINT32_MAX;
+                        uint32_t oldestWaitedIndex = UINT32_MAX;
+                        size_t queueDepthBefore = 0;
+                        bool validIndex = false;
+                        if (indexTracker != m_proxyIndexTrackers.end()) {
+                            auto& tracker = indexTracker->second;
+                            queueDepthBefore = tracker.queue.size();
+                            const auto* oldest = tracker.releaseTarget();
+                            fifoIndex = oldest ? oldest->index : UINT32_MAX;
+                            for (const auto& entry : tracker.queue) {
+                                if (entry.acquired && entry.successfullyWaited) {
+                                    oldestWaitedIndex = entry.index;
+                                    break;
+                                }
+                            }
+                            validIndex = tracker.canRelease() && tracker.error.empty();
+                            if (!validIndex) invalidateProxyIndex(tracker.error.c_str());
+                            if (validIndex && legacyIndex != fifoIndex) ++m_proxyIndexLegacyMismatchCount;
+                            if (validIndex) selectedCopyIndex = tracker.selectedCopyIndex(m_proxyIndexMode);
+                            if (m_proxyIndexMode == 1) {
+                                if (!validIndex) {
+                                    logProxyIndexRelease(swapchain, fifoIndex, oldestWaitedIndex,
+                                                         UINT32_MAX, legacyIndex, false,
+                                                         XR_ERROR_CALL_ORDER_INVALID, queueDepthBefore, tracker);
+                                    return XR_ERROR_CALL_ORDER_INVALID;
+                                }
+                                // Reuse the existing copy/release helper unchanged; only select its image.
+                                swapchainIt->second.acquiredImageIndex = selectedCopyIndex;
+                            }
+                        }
                         const bool copiedNow = m_subProxySwapchains.at(swapchain) && !m_subProxyCopyCompleted[swapchain];
                         const auto result = releaseSubProxyImage(swapchain, "release", releaseInfo);
                         // All resource queries, comparison and logs are AFTER downstream release.
                         logProxyUsageRelease(swapchain, result);
                         if (m_proxyScopeEnabled) logProxyScopeRelease(swapchain, result, copiedNow);
+                        // Existing observers inspect acquiredImageIndex for the image just copied.
+                        // Restore the last acquire once those post-release observers have run.
+                        if (indexTracker != m_proxyIndexTrackers.end() && m_proxyIndexMode == 1)
+                            swapchainIt->second.acquiredImageIndex = legacyIndex;
+                        if (indexTracker != m_proxyIndexTrackers.end()) {
+                            auto& tracker = indexTracker->second;
+                            if (validIndex && XR_FAILED(result))
+                                invalidateProxyIndex("downstream_release_failed");
+                            if (XR_SUCCEEDED(result) && validIndex) {
+                                ++m_proxyIndexReleaseCount;
+                                if (!tracker.releaseSucceeded()) invalidateProxyIndex(tracker.error.c_str());
+                            }
+                            logProxyIndexRelease(swapchain, fifoIndex, oldestWaitedIndex,
+                                selectedCopyIndex, legacyIndex, validIndex,
+                                result, queueDepthBefore, tracker);
+                        }
                         return result;
                     }
                     if (m_proxyTimingEnabled) {
@@ -5095,6 +5210,56 @@ namespace {
             return result;
         }
 
+        void invalidateProxyIndex(const char* reason) {
+            ++m_proxyIndexFifoErrors;
+            m_proxyIndexStrict = false;
+            if (m_proxyIndexReason.empty()) m_proxyIndexReason = reason;
+            if (m_proxyIndexErrorLogs++ < 16) {
+                Log("[PROXY-INDEX] invalid app=%s mode=%u reason=%s fifo_errors=%llu\n",
+                    m_applicationName.c_str(), m_proxyIndexMode, reason,
+                    static_cast<unsigned long long>(m_proxyIndexFifoErrors));
+            }
+        }
+
+        void logProxyIndexRelease(XrSwapchain swapchain, uint32_t oldestAcquiredIndex,
+                                  uint32_t oldestWaitedIndex, uint32_t selectedCopyIndex,
+                                  uint32_t legacyIndex, bool validIndex, XrResult result,
+                                  size_t queueDepthBefore, const proxy_index::Tracker& tracker) {
+            if (m_proxyIndexReleaseLogs++ >= 48) return;
+            Log("[PROXY-INDEX] event=release app=%s mode=%u swapchain=%p "
+                "oldest_acquired_index=%u oldest_waited_index=%u last_acquired_index=%u "
+                "selected_copy_index=%u legacy_index=%u mismatch=%u valid=%u "
+                "downstream_release_result=%s queue_depth_before=%zu queue_depth_after=%zu queue=%s\n",
+                m_applicationName.c_str(), m_proxyIndexMode, swapchain, oldestAcquiredIndex,
+                oldestWaitedIndex, legacyIndex, selectedCopyIndex, legacyIndex,
+                validIndex && legacyIndex != oldestAcquiredIndex, validIndex, xr::ToCString(result),
+                queueDepthBefore, tracker.queue.size(), tracker.state().c_str());
+        }
+
+        void finishProxyIndexSession() {
+            size_t pendingAtSessionEnd = 0;
+            for (const auto& tracker : m_proxyIndexTrackers) {
+                pendingAtSessionEnd += tracker.second.queue.size();
+            }
+            const bool strict = m_proxyIndexStrict && m_proxyScopeStrict && m_proxyIndexReleaseCount > 0;
+            const char* reason = !m_proxyIndexReason.empty() ? m_proxyIndexReason.c_str() :
+                !m_proxyScopeStrict ? (m_proxyScopeReason.empty() ? "scope_comparison_invalid" :
+                                       m_proxyScopeReason.c_str()) :
+                m_proxyIndexReleaseCount == 0 ? "no_proxy_releases" : "ok";
+            Log("[PROXY-INDEX] final_summary app=%s mode=%u acquire_count=%llu "
+                "successful_wait_count=%llu timeout_count=%llu release_count=%llu "
+                "legacy_index_mismatch_count=%llu fifo_errors=%llu pending_at_session_end=%zu "
+                "pending_at_destroy=%llu strict_comparison=%u reason=%s\n",
+                m_applicationName.c_str(), m_proxyIndexMode,
+                static_cast<unsigned long long>(m_proxyIndexAcquireCount),
+                static_cast<unsigned long long>(m_proxyIndexSuccessfulWaitCount),
+                static_cast<unsigned long long>(m_proxyIndexTimeoutCount),
+                static_cast<unsigned long long>(m_proxyIndexReleaseCount),
+                static_cast<unsigned long long>(m_proxyIndexLegacyMismatchCount),
+                static_cast<unsigned long long>(m_proxyIndexFifoErrors), pendingAtSessionEnd,
+                static_cast<unsigned long long>(m_proxyIndexPendingAtDestroy), strict, reason);
+        }
+
         const std::string getPath(XrPath path) {
             if (path == XR_NULL_PATH) {
                 return "";
@@ -5195,6 +5360,15 @@ namespace {
         std::atomic<uint32_t> m_proxyTimingLogs{0};
         bool m_proxyUsageEnabled{false}, m_proxyUsageReferenceValid{false}, m_proxyUsageRunStrict{true};
         bool m_proxyScopeEnabled{false}, m_proxyScopeStrict{false};
+        bool m_proxyIndexEnabled{false}, m_proxyIndexStrict{true};
+        uint32_t m_proxyIndexMode{0};
+        std::string m_proxyIndexReason;
+        std::map<XrSwapchain, proxy_index::Tracker> m_proxyIndexTrackers;
+        uint64_t m_proxyIndexAcquireCount{0}, m_proxyIndexSuccessfulWaitCount{0}, m_proxyIndexTimeoutCount{0};
+        uint64_t m_proxyIndexReleaseCount{0}, m_proxyIndexLegacyMismatchCount{0}, m_proxyIndexFifoErrors{0};
+        uint64_t m_proxyIndexPendingAtDestroy{0};
+        uint32_t m_proxyIndexAcquireLogs{0}, m_proxyIndexWaitLogs{0}, m_proxyIndexReleaseLogs{0};
+        uint32_t m_proxyIndexErrorLogs{0}, m_proxyIndexTeardownLogs{0};
         uint32_t m_proxyScopeMode{0};
         std::string m_proxyScopeReason;
         ID3D12CommandQueue* m_proxyScopeQueue{nullptr};
